@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,12 +14,15 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/davefinster/multits/internal/config"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
@@ -87,9 +91,21 @@ func client(ctx context.Context, t *testing.T, controlURL, name string) *tsnet.S
 		Store:      new(mem.Store),
 		Logf:       logger.Discard,
 	}
+	// MULTITS_E2E_TSLOG=1 shows the clients' own tsnet logs, filter drops
+	// and all.
+	if os.Getenv("MULTITS_E2E_TSLOG") != "" {
+		s.Logf = func(format string, args ...any) { t.Logf(name+": "+format, args...) }
+	}
 	t.Cleanup(func() { _ = s.Close() })
 	if _, err := s.Up(ctx); err != nil {
 		t.Fatalf("%s: %v", name, err)
+	}
+	// MULTITS_E2E_PCAP=DIR captures what each client's node sends and
+	// receives, as DIR/<name>.pcap.
+	if dir := os.Getenv("MULTITS_E2E_PCAP"); dir != "" {
+		if err := s.CapturePcap(ctx, filepath.Join(dir, name+".pcap")); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return s
 }
@@ -131,7 +147,16 @@ func TestE2E(t *testing.T) {
 	go func() { _ = app.Serve(ln) }()
 	t.Cleanup(func() { _ = app.Close() })
 
-	udp, err := net.ListenPacket("udp", ":8053")
+	// With don't-fragment set, as quic-go sets it: a datagram the host's
+	// MTU cannot carry is refused by the kernel rather than sent.
+	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
+		var serr error
+		err := c.Control(func(fd uintptr) {
+			serr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, unix.IPV6_DONTFRAG, 1)
+		})
+		return errors.Join(err, serr)
+	}}
+	udp, err := lc.ListenPacket(context.Background(), "udp", ":8053")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +168,14 @@ func TestE2E(t *testing.T) {
 			if err != nil {
 				return
 			}
-			_, _ = udp.WriteTo(append([]byte(from.String()+" said "), b[:n]...), from)
+			reply := append([]byte(from.String()+" said "), b[:n]...)
+			if string(b[:n]) == "quic-sized" {
+				// What quic-go sends first: 1280 bytes of payload.
+				reply = bytes.Repeat([]byte{'q'}, 1280)
+			}
+			if _, err := udp.WriteTo(reply, from); err != nil {
+				t.Errorf("replying to %s: %v", from, err)
+			}
 		}
 	}()
 
@@ -263,6 +295,45 @@ func TestE2E(t *testing.T) {
 		t.Logf("uploaded %d MiB over IPv6 in %v", len(big)>>20, time.Since(start).Round(time.Millisecond))
 	})
 
+	t.Run("TCP is never fragmented", func(t *testing.T) {
+		for _, ts := range g.Status().Tailnets {
+			if ts.Outbound.Fragmented != 0 {
+				t.Errorf("%s: %d of the host's packets were fragmented: the MSS clamp let a segment through that the tailnet cannot carry", ts.Name, ts.Outbound.Fragmented)
+			}
+		}
+	})
+
+	t.Run("a quic-sized datagram crosses a 1280 tailnet", func(t *testing.T) {
+		// IPv4 only: tailscale.com v1.104.7's netstack drops the first
+		// fragment of an IPv6 datagram (see xlat's
+		// TestFragmentsReassembleInGVisor), and these clients are netstack.
+		for _, gw := range []netip.Addr{gwA[0]} {
+			eventually(t, "quic-sized to "+gw.String(), func() error {
+				conn, err := clientA.Dial(ctx, "udp", netip.AddrPortFrom(gw, 8053).String())
+				if err != nil {
+					return err
+				}
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+				if _, err := conn.Write([]byte("quic-sized")); err != nil {
+					return err
+				}
+				b := make([]byte, 2048)
+				n, err := conn.Read(b)
+				if err != nil {
+					return err
+				}
+				if n != 1280 || !bytes.Equal(b[:n], bytes.Repeat([]byte{'q'}, 1280)) {
+					return fmt.Errorf("got %d bytes", n)
+				}
+				return nil
+			})
+		}
+		if f := g.Status().Tailnets[0].Outbound.Fragmented; f < 1 {
+			t.Errorf("a's fragmented count is %d: the datagram crossed whole", f)
+		}
+	})
+
 	t.Run("whois", func(t *testing.T) {
 		h := g.Handler()
 		for pseudo, want := range map[string]string{"fdcc:79e6:100::6440:2": "client-a", "fdcc:79e6:200::6440:2": "client-b"} {
@@ -345,7 +416,11 @@ func newWorld(t *testing.T, configure ...func(*config.File)) *world {
 		t.Fatal(err)
 	}
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	level := slog.LevelInfo
+	if os.Getenv("MULTITS_E2E_TSLOG") != "" {
+		level = slog.LevelDebug
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	g, err := New(cfg, nil, log)
 	if err != nil {
 		t.Fatal(err)

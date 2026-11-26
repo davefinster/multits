@@ -23,6 +23,9 @@ type counters struct {
 	// drops are by reason; the last slot is a packet translated but not
 	// sent, because the node was not up or not keeping up.
 	drops [2][xlat.NumReasons + 1]atomic.Uint64
+	// fragmented counts packets from the host too large for the tailnet,
+	// sent as fragments.
+	fragmented atomic.Uint64
 }
 
 func (c *counters) pass(d direction, n int) {
@@ -34,13 +37,18 @@ func (c *counters) drop(d direction, r xlat.Reason) { c.drops[d][r].Add(1) }
 
 // Counts is a snapshot of counters.
 type Counts struct {
-	Packets uint64            `json:"packets"`
-	Bytes   uint64            `json:"bytes"`
-	Dropped map[string]uint64 `json:"dropped,omitempty"`
+	Packets uint64 `json:"packets"`
+	Bytes   uint64 `json:"bytes"`
+	// Fragmented is how many of the host's packets were fragmented to fit.
+	Fragmented uint64            `json:"fragmented,omitempty"`
+	Dropped    map[string]uint64 `json:"dropped,omitempty"`
 }
 
 func (c *counters) snapshot(d direction) Counts {
 	out := Counts{Packets: c.packets[d].Load(), Bytes: c.bytes[d].Load()}
+	if d == outbound {
+		out.Fragmented = c.fragmented.Load()
+	}
 	for r := range c.drops[d] {
 		n := c.drops[d][r].Load()
 		if n == 0 {

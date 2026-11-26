@@ -157,6 +157,10 @@ type Result struct {
 	Tailnet uint8
 	// Packet is the output, a slice of the buffer the caller passed.
 	Packet []byte
+	// Fragments, when set, replace Packet: a packet from the host too large
+	// for the tailnet, in fragments that fit, each its own allocation and
+	// sent in order.
+	Fragments [][]byte
 }
 
 func drop(r Reason) Result { return Result{Verdict: Drop, Reason: r} }
@@ -427,6 +431,15 @@ func (x *Translator) fromTailnet4(tailnet uint8, pkt, out []byte) Result {
 	if reason != OK {
 		return drop(reason)
 	}
+	if h.proto == protoTCP && h.offset == 0 {
+		// What the peer offers is what the host will send it, and the host's
+		// MTU is larger than the tailnet's.
+		hdr := ipv6HeaderLen
+		if h.fragmented() {
+			hdr += fragHeaderLen
+		}
+		clampMSS(out[hdr:n], uint16(x.tailnetMTU-ipv4HeaderLen-20))
+	}
 	return Result{Verdict: Forward, Packet: out[:n]}
 }
 
@@ -538,12 +551,17 @@ func (x *Translator) fromTailnet6(tailnet uint8, pkt, out []byte) Result {
 	if reason := fixup6(b, pkt[8:24], pkt[24:40], quote); reason != OK {
 		return drop(reason)
 	}
+	clampMSS6(b, x.tailnetMTU)
 	return Result{Verdict: Forward, Packet: b}
 }
 
 // toTailnet6 moves IPv6 from the host back onto a tailnet's addresses.
 func (x *Translator) toTailnet6(tailnet uint8, pkt, src, dst, out []byte) Result {
-	if len(pkt) > x.tailnetMTU {
+	// Too large for the tailnet, the packet is fragmented, as the host would
+	// have done itself had its MTU been the tailnet's: see fragment6. Only
+	// one with extension headers, which would need splitting into the part
+	// every fragment repeats and the part they share, is refused instead.
+	if len(pkt) > x.tailnetMTU && pkt[6] != protoTCP && pkt[6] != protoUDP && pkt[6] != protoICMPv6 {
 		return x.tooBig(pkt, out, x.tailnetMTU)
 	}
 
@@ -570,6 +588,10 @@ func (x *Translator) toTailnet6(tailnet uint8, pkt, src, dst, out []byte) Result
 	}
 	if reason := fixup6(b, pkt[8:24], pkt[24:40], quote); reason != OK {
 		return drop(reason)
+	}
+	clampMSS6(b, x.tailnetMTU)
+	if len(b) > x.tailnetMTU {
+		return x.fragment6(b)
 	}
 	return Result{Verdict: Forward, Packet: b}
 }
@@ -636,15 +658,12 @@ func (x *Translator) toTailnet4(pkt, src4, dst4, out []byte) Result {
 	}
 	upper := pkt[e.upper:]
 	total := ipv4HeaderLen + len(upper)
-	if total > x.tailnetMTU {
-		return x.tooBig(pkt, out, x.tailnetMTU+ipv6HeaderLen-ipv4HeaderLen)
-	}
 
 	if e.proto == protoICMPv6 {
 		if e.frag {
 			return drop(FragmentedICMP)
 		}
-		return x.icmp6to4(pkt, src4, dst4, upper, out)
+		return x.fit4(x.icmp6to4(pkt, src4, dst4, upper, out))
 	}
 
 	id, frag := x.fragFields(&e, total)
@@ -654,7 +673,18 @@ func (x *Translator) toTailnet4(pkt, src4, dst4, out []byte) Result {
 	if e.offset == 0 && !adjustTransport(e.proto, l4, addrSum(pkt[8:24], pkt[24:40]), addrSum(src4, dst4), false) {
 		return drop(Malformed)
 	}
-	return Result{Verdict: Forward, Packet: out[:total]}
+	if e.offset == 0 && e.proto == protoTCP {
+		clampMSS(l4, uint16(x.tailnetMTU-ipv4HeaderLen-20))
+	}
+	return x.fit4(Result{Verdict: Forward, Packet: out[:total]})
+}
+
+// fit4 fragments an IPv4 packet for the tailnet that is too large for it.
+func (x *Translator) fit4(res Result) Result {
+	if res.Verdict != Forward || len(res.Packet) <= x.tailnetMTU {
+		return res
+	}
+	return x.fragment4(res.Packet)
 }
 
 // fragFields is the identification and the flags and offset of an IPv4

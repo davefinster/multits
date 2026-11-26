@@ -74,16 +74,26 @@ the rest:
 | route | why |
 | --- | --- |
 | `local fdcc:79e6:T1::/44 dev lo table local` per tailnet | AnyIP. Every gateway address on the tailnet is the host's own, so a socket on `[::]` accepts connections to any of them with nothing assigned. This covers node addresses, Service VIPs and every address in an advertised route. |
-| `fdcc:79e6:T00::/48 dev multits0 mtu 1300 src <node's IPv4 pseudo>` | IPv4 peers. The application's replies and its own dials go into the device. |
-| `fdcc:79e6:T00::/44 dev multits0 mtu 1280 src <node's IPv6 pseudo>` | every other space of the peer side |
+| `fdcc:79e6:T00::/48 dev multits0 src <node's IPv4 pseudo>` | IPv4 peers. The application's replies and its own dials go into the device. |
+| `fdcc:79e6:T00::/44 dev multits0 src <node's IPv6 pseudo>` | every other space of the peer side |
 | `fdcc:79e6::/32 dev multits0` | everything else in the prefix, so a tailnet that isn't configured is answered with an ICMPv6 error (`network is unreachable`) instead of leaking out the default route |
 
 The node's own addresses and its Services' VIPs are also assigned to the
 device as /128s, for applications that bind one, and they become the routes'
-preferred sources. The device's MTU is the tailnet's plus 20, because an
-IPv4 packet of the tailnet's MTU is that much larger as IPv6. Each route
-carries its own family's MTU, so TCP's MSS is right from the first SYN and
-no Packet Too Big is ever needed for TCP.
+preferred sources.
+
+**MTU.** The device and its routes have the tailnet's MTU plus 48: 1328 for
+Tailscale's 1280. That's room for an IPv6 packet carrying 1280 bytes of UDP,
+which is what quic-go, and so Traefik's HTTP/3, sends its first packets
+with, and with don't-fragment set. On an interface of the tailnet's own
+1280, the kernel refuses every one of them. A packet from the host that the
+tailnet can't carry whole is fragmented by the gateway, and the peer
+reassembles it. TCP never needs that: the gateway clamps the MSS of every
+SYN, in both directions, to what the tailnet carries (1240 for an IPv4 peer,
+1220 for IPv6), even for a peer behind a subnet router that offers its
+LAN's. The end-to-end tests check both: 4 MiB of TCP each way with nothing
+fragmented, and a 1280-byte datagram sent with don't-fragment arriving
+whole.
 
 On the tailnet side, each node is a `tsnet.Server` given an in-memory
 `tun.Device`. With one, tsnet hands the device every packet for the node's
@@ -108,7 +118,9 @@ sent it.
 - **Refused from the host**: a source that isn't the gateway's own address
   on the destination's tailnet, or is in the wrong family, gets ICMPv6
   destination unreachable code 5 (connect fails with `EACCES`). An unknown
-  tailnet gets code 0. A packet too big for the tailnet gets Packet Too Big.
+  tailnet gets code 0. A packet too big for the tailnet is fragmented (see
+  MTU above), except an IPv6 one with extension headers, which gets Packet
+  Too Big.
 
 Translation costs about 40 ns per packet (`go test -bench . ./internal/xlat`).
 
@@ -334,5 +346,16 @@ The tests refuse to run in a network namespace that has any interface but
   as running tailscaled in the pod.
 - **IPv6 outside Tailscale's range** needs an `ipv6Spaces` entry. Unencodable
   addresses are dropped and counted.
+- **Fragmented IPv6 doesn't reach a netstack peer.** Through tailscale.com
+  v1.104.7, a node on Tailscale's userspace netstack (tsnet, or tailscaled
+  with `--tun=userspace-networking`) drops the first fragment of IPv6 TCP
+  and UDP. `wgengine/netstack/gro.RXChecksumOffload` checks the transport
+  checksum from the fragment header on, because its IPv6 branch doesn't
+  skip fragments the way its IPv4 branch does. Kernel-mode nodes and IPv4
+  are unaffected. The only fragments the gateway sends are UDP and ICMP
+  larger than 1280 bytes, such as quic-go's first packets. So HTTP/3 to
+  such a peer works over IPv4 and not IPv6 until that's fixed upstream.
+  `TestFragmentsReassembleInGVisor` checks the fragments against gVisor
+  itself.
 - The host-to-tailnet path allocates per packet, and one device queue is the
   default. Neither has been profiled under load.

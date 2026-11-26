@@ -350,10 +350,18 @@ func (g *Gateway) fromHost(q tun.Queue) {
 			switch res.Verdict {
 			case xlat.Forward:
 				c, node := g.counts[res.Tailnet], g.byID[res.Tailnet]
-				if node.Send(res.Packet) {
-					c.pass(outbound, len(res.Packet))
+				pkts := res.Fragments
+				if pkts == nil {
+					pkts = [][]byte{res.Packet}
 				} else {
-					c.drop(outbound, xlat.NumReasons) // not up, or not keeping up
+					c.fragmented.Add(1)
+				}
+				for _, p := range pkts {
+					if node.Send(p) {
+						c.pass(outbound, len(p))
+					} else {
+						c.drop(outbound, xlat.NumReasons) // not up, or not keeping up
+					}
 				}
 			case xlat.Reply:
 				g.countHost(res.Reason)

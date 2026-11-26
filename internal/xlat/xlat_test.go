@@ -474,34 +474,161 @@ func TestDontFragmentFollowsSize(t *testing.T) {
 	}
 }
 
-func TestTooBigForTheTailnet(t *testing.T) {
+// A packet from the host too large for the tailnet is fragmented to fit,
+// and the fragments reassemble into the datagram the host sent: what lets
+// quic-go's 1280-byte first packets cross a 1280-byte tailnet.
+func TestFragmentsWhatTheTailnetCannotCarry(t *testing.T) {
 	x := newTestTranslator(t)
-	// 1300 bytes of IPv6 is 1280 of IPv4: the most a 1280 tailnet takes.
+
+	// 1300 bytes of IPv6 is 1280 of IPv4: the most a 1280 tailnet takes
+	// whole.
 	fits := packet6("fdcc:79e6:110::6440:1", "fdcc:79e6:100::6440:2", protoUDP, udpDatagram(1, 2, string(make([]byte, 1300-48))))
-	if res := toTailnet(t, x, fits); res.Verdict != Forward || len(res.Packet) != 1280 {
+	if res := toTailnet(t, x, fits); res.Verdict != Forward || len(res.Packet) != 1280 || res.Fragments != nil {
 		t.Fatalf("1300 bytes: %v %v %d", res.Verdict, res.Reason, len(res.Packet))
 	}
 
-	over := packet6("fdcc:79e6:110::6440:1", "fdcc:79e6:100::6440:2", protoUDP, udpDatagram(1, 2, string(make([]byte, 1301-48))))
-	res := toTailnet(t, x, over)
-	if res.Verdict != Reply || res.Reason != TooBig {
-		t.Fatalf("1301 bytes: %v %v", res.Verdict, res.Reason)
+	// quic-go's first packet: 1280 bytes of UDP payload.
+	payload := make([]byte, 1280)
+	for i := range payload {
+		payload[i] = byte(i)
 	}
-	if res.Packet[40] != icmp6PacketTooBig || binary.BigEndian.Uint32(res.Packet[44:]) != 1300 {
-		t.Errorf("type %d mtu %d", res.Packet[40], binary.BigEndian.Uint32(res.Packet[44:]))
+	quic := packet6("fdcc:79e6:110::6440:1", "fdcc:79e6:100::6440:2", protoUDP, udpDatagram(443, 50000, string(payload)))
+	res := toTailnet(t, x, quic)
+	if res.Verdict != Forward || len(res.Fragments) != 2 {
+		t.Fatalf("IPv4: %v %v, %d fragments", res.Verdict, res.Reason, len(res.Fragments))
 	}
-	if dst := addrAt(res.Packet[24:40]); dst != "fdcc:79e6:110::6440:1" {
-		t.Errorf("sent to %s", dst)
+	var data []byte
+	id := binary.BigEndian.Uint16(res.Fragments[0][4:])
+	for i, f := range res.Fragments {
+		if len(f) > 1280 {
+			t.Errorf("fragment %d is %d bytes", i, len(f))
+		}
+		valid4header(t, f)
+		frag := binary.BigEndian.Uint16(f[6:])
+		if want := uint16(len(data) / 8); frag&0x1fff != want {
+			t.Errorf("fragment %d offset %d, want %d", i, frag&0x1fff, want)
+		}
+		if more := frag&0x2000 != 0; more != (i < len(res.Fragments)-1) {
+			t.Errorf("fragment %d more-fragments %v", i, more)
+		}
+		if frag&0x4000 != 0 || binary.BigEndian.Uint16(f[4:]) != id {
+			t.Errorf("fragment %d: flags %#x id %d, want no DF and id %d", i, frag, binary.BigEndian.Uint16(f[4:]), id)
+		}
+		data = append(data, f[20:]...)
 	}
-	if len(res.Packet) > minIPv6MTU {
-		t.Errorf("error is %d bytes", len(res.Packet))
+	f0 := res.Fragments[0]
+	if naiveSum(pseudo4(f0[12:16], f0[16:20], protoUDP, len(data)), data) != 0xffff {
+		t.Error("the reassembled datagram's checksum is wrong")
+	}
+	if !bytes.Equal(data[8:], payload) {
+		t.Error("the reassembled datagram's payload differs")
+	}
+
+	// The same over IPv6: fragment headers.
+	quic6 := packet6("fdcc:79e6:111::1", "fdcc:79e6:101::2", protoUDP, udpDatagram(443, 50000, string(payload)))
+	res = toTailnet(t, x, quic6)
+	if res.Verdict != Forward || len(res.Fragments) != 2 {
+		t.Fatalf("IPv6: %v %v, %d fragments", res.Verdict, res.Reason, len(res.Fragments))
+	}
+	data = nil
+	for i, f := range res.Fragments {
+		if len(f) > 1280 || f[6] != protoFragment || f[40] != protoUDP {
+			t.Errorf("fragment %d: %d bytes, next %d, inner %d", i, len(f), f[6], f[40])
+		}
+		fo := binary.BigEndian.Uint16(f[42:])
+		if int(fo>>3) != len(data)/8 || (fo&1 == 1) != (i == 0) {
+			t.Errorf("fragment %d: offset word %#x", i, fo)
+		}
+		if got := addrAt(f[24:40]); got != "fd7a:115c:a1e0::2" {
+			t.Errorf("fragment %d to %s", i, got)
+		}
+		data = append(data, f[48:]...)
+	}
+	f0 = res.Fragments[0]
+	if naiveSum(pseudo6b(f0[8:24], f0[24:40], protoUDP, len(data)), data) != 0xffff || !bytes.Equal(data[8:], payload) {
+		t.Error("the reassembled IPv6 datagram is wrong")
+	}
+
+	// A packet with extension headers is not split; the host is told the
+	// tailnet's MTU instead.
+	hbh := append([]byte{protoUDP, 0, 1, 4, 0, 0, 0, 0}, udpDatagram(1, 2, string(payload))...)
+	withExt := packet6("fdcc:79e6:111::1", "fdcc:79e6:101::2", protoUDP, udpDatagram(1, 2, ""))
+	withExt = append(withExt[:40], hbh...)
+	binary.BigEndian.PutUint16(withExt[4:], uint16(len(hbh)))
+	withExt[6] = protoHopByHop
+	res = toTailnet(t, x, withExt)
+	if res.Verdict != Reply || res.Packet[40] != icmp6PacketTooBig || binary.BigEndian.Uint32(res.Packet[44:]) != 1280 {
+		t.Errorf("with a hop-by-hop header: %v %v", res.Verdict, res.Reason)
+	}
+}
+
+func valid4header(t *testing.T, pkt []byte) {
+	t.Helper()
+	if naiveSum(pkt[:20]) != 0xffff || int(binary.BigEndian.Uint16(pkt[2:])) != len(pkt) {
+		t.Errorf("IPv4 header wrong: checksum or length")
+	}
+}
+
+// synWithMSS is a TCP SYN offering mss.
+func synWithMSS(sport, dport, mss int) []byte {
+	b := tcpSegment(sport, dport, "")
+	b[12] = 0x60 // 24 bytes of header
+	return append(b, 2, 4, byte(mss>>8), byte(mss))
+}
+
+func mssOf(tcp []byte) int { return int(binary.BigEndian.Uint16(tcp[22:])) }
+
+// Neither end is offered a segment larger than the tailnet carries, so TCP
+// never needs fragmenting.
+func TestMSSIsClamped(t *testing.T) {
+	x := newTestTranslator(t)
+
+	// A peer behind a subnet router offers what its LAN carries.
+	in4 := toHost(t, x, 1, packet4("100.64.0.2", "100.64.0.1", protoTCP, 0x4000, synWithMSS(40000, 443, 1460), true))
+	if got := mssOf(in4.Packet[40:]); got != 1240 {
+		t.Errorf("IPv4 peer's MSS %d, want 1240", got)
+	}
+	valid6(t, in4.Packet)
+
+	in6 := toHost(t, x, 1, packet6("fd7a:115c:a1e0::2", "fd7a:115c:a1e0::1", protoTCP, synWithMSS(40000, 443, 1440)))
+	if got := mssOf(in6.Packet[40:]); got != 1220 {
+		t.Errorf("IPv6 peer's MSS %d, want 1220", got)
+	}
+	valid6(t, in6.Packet)
+
+	// The host's own offer is from its larger MTU.
+	out4 := toTailnet(t, x, packet6("fdcc:79e6:110::6440:1", "fdcc:79e6:100::6440:2", protoTCP, synWithMSS(443, 40000, 1268)))
+	if got := mssOf(out4.Packet[20:]); got != 1240 {
+		t.Errorf("host's MSS to an IPv4 peer %d, want 1240", got)
+	}
+	valid4(t, out4.Packet)
+
+	out6 := toTailnet(t, x, packet6("fdcc:79e6:111::1", "fdcc:79e6:101::2", protoTCP, synWithMSS(443, 40000, 1268)))
+	if got := mssOf(out6.Packet[40:]); got != 1220 {
+		t.Errorf("host's MSS to an IPv6 peer %d, want 1220", got)
+	}
+	valid6(t, out6.Packet)
+
+	// A smaller offer stands, and a segment that is not a SYN is untouched.
+	small := toHost(t, x, 1, packet4("100.64.0.2", "100.64.0.1", protoTCP, 0x4000, synWithMSS(40000, 443, 1000), true))
+	if got := mssOf(small.Packet[40:]); got != 1000 {
+		t.Errorf("a smaller MSS became %d", got)
+	}
+	ack := synWithMSS(40000, 443, 1460)
+	ack[13] = 0x10
+	if got := mssOf(toHost(t, x, 1, packet4("100.64.0.2", "100.64.0.1", protoTCP, 0x4000, ack, true)).Packet[40:]); got != 1460 {
+		t.Errorf("a non-SYN's option became %d", got)
+	}
+
+	// At an odd offset, behind a NOP, the checksum still holds.
+	odd := tcpSegment(40000, 443, "")
+	odd[12] = 0x70 // 28 bytes
+	odd = append(odd, 1, 2, 4, 0x05, 0xb4, 1, 1, 0)
+	res := toHost(t, x, 1, packet4("100.64.0.2", "100.64.0.1", protoTCP, 0x4000, odd, true))
+	if got := int(binary.BigEndian.Uint16(res.Packet[40+23:])); got != 1240 {
+		t.Errorf("MSS behind a NOP %d", got)
 	}
 	valid6(t, res.Packet)
-
-	v6 := packet6("fdcc:79e6:111::1", "fdcc:79e6:101::2", protoUDP, udpDatagram(1, 2, string(make([]byte, 1281-48))))
-	if res := toTailnet(t, x, v6); res.Verdict != Reply || binary.BigEndian.Uint32(res.Packet[44:]) != 1280 {
-		t.Errorf("IPv6 1281 bytes: %v %v", res.Verdict, res.Reason)
-	}
 }
 
 func TestRefusedFromTheHost(t *testing.T) {

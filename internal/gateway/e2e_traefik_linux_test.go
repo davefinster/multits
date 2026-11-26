@@ -133,6 +133,12 @@ http:
 			url = "http://" + netip.AddrPortFrom(w.gwB[0], 8080).String() + tc.path
 		}
 		eventually(t, tc.name, func() error {
+			start := time.Now()
+			defer func() {
+				if d := time.Since(start); d > time.Second {
+					t.Logf("%s: a request took %v", tc.name, d.Round(time.Millisecond))
+				}
+			}()
 			body, code, err := get(c, url)
 			if err != nil {
 				return err
