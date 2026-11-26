@@ -3,6 +3,7 @@
 //
 //	multits run    -config multits.yaml [-v]
 //	multits check  -config multits.yaml
+//	multits probe  [URL]
 //	multits version
 //	multits encode -config multits.yaml TAILNET IP [local|remote]
 //	multits decode -config multits.yaml ADDRESS
@@ -18,13 +19,17 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/davefinster/multits/internal/addr"
 	"github.com/davefinster/multits/internal/config"
@@ -41,6 +46,20 @@ func main() {
 	cmd, args := os.Args[1], os.Args[2:]
 	if cmd == "version" {
 		fmt.Println(version)
+		return
+	}
+	if cmd == "probe" {
+		// An exec probe for an image with nothing else in it: the API
+		// listens on the loopback, which a kubelet's HTTP probe cannot
+		// reach from the node.
+		url := "http://" + config.DefaultAPI + "/healthz"
+		if len(args) > 0 {
+			url = args[0]
+		}
+		if err := probe(url); err != nil {
+			fmt.Fprintln(os.Stderr, "multits probe:", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -74,6 +93,7 @@ func usage() {
   multits check  -config FILE
   multits encode -config FILE TAILNET IP [local|remote]
   multits decode -config FILE ADDRESS
+  multits probe  [URL]
   multits version`)
 	os.Exit(2)
 }
@@ -97,6 +117,21 @@ func run(path string, verbose bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	return g.Run(ctx)
+}
+
+// probe GETs url and fails unless it answers 200.
+func probe(url string) error {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s: %s: %s", url, resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 func check(path string) error {

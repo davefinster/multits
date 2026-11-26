@@ -208,7 +208,10 @@ The image is distroless static: the binary and CA certificates. It runs as
 root, which the gateway needs for `CAP_NET_ADMIN`, for making
 `/dev/net/tun`, and for port 53. Its default command is `run -config
 /etc/multits/multits.yaml`. `multits version` prints the commit it was built
-from.
+from. `multits probe [URL]` GETs the local API, `/healthz` by default, and
+fails unless it answers 200. It's an exec probe for an image with nothing
+else in it, since the API listens on the loopback, where a kubelet's HTTP
+probe can't reach.
 
 The GHCR package took the repository's visibility when first published:
 public, so a cluster pulls it with no `imagePullSecret`. To build without
