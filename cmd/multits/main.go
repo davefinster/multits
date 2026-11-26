@@ -140,7 +140,12 @@ func check(path string) error {
 		return err
 	}
 	s := cfg.Scheme
-	fmt.Printf("prefix   %s\ngateway  %s\ndevice   %s, MTU %d (tailnets %d)\n", s.Prefix(), s.Gateway(), cfg.Device.Name, cfg.TailnetMTU+48, cfg.TailnetMTU)
+	if cfg.Device.FitTailnet {
+		fmt.Printf("prefix   %s\ngateway  %s\ndevice   %s, MTU %d fitted to the tailnets' %d (IPv4 space %d, IPv6 %d)\n",
+			s.Prefix(), s.Gateway(), cfg.Device.Name, cfg.TailnetMTU+20, cfg.TailnetMTU, cfg.TailnetMTU+20, cfg.TailnetMTU)
+	} else {
+		fmt.Printf("prefix   %s\ngateway  %s\ndevice   %s, MTU %d, room for quic-go over the tailnets' %d\n", s.Prefix(), s.Gateway(), cfg.Device.Name, cfg.TailnetMTU+48, cfg.TailnetMTU)
+	}
 	switch {
 	case len(cfg.DNS.Listen) == 0:
 		fmt.Printf("dns      off\n\n")
