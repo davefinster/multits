@@ -42,6 +42,8 @@ type File struct {
 	Device struct {
 		Name   string `yaml:"name"`
 		Queues int    `yaml:"queues"`
+		// MTU is "quic" (the default) or "tailnet"; see Device.FitTailnet.
+		MTU string `yaml:"mtu"`
 	} `yaml:"device"`
 
 	API struct {
@@ -107,6 +109,16 @@ type Config struct {
 type Device struct {
 	Name   string
 	Queues int
+	// FitTailnet sizes the device and its routes to exactly what the
+	// tailnet carries, per family: nothing the host sends then needs
+	// fragmenting. Without it they leave room for quic-go's 1280-byte first
+	// packets, which upstream quic-go sends whatever the path, and the
+	// gateway fragments what the tailnet cannot carry whole. For an
+	// application that sizes its own first packets (Traefik with
+	// http3.initialPacketSize), FitTailnet is better: quic-go's path MTU
+	// discovery then settles on the largest packet the tailnet carries,
+	// rather than on one that is fragmented every time.
+	FitTailnet bool
 }
 
 // API is the local API.
@@ -188,6 +200,13 @@ func (f *File) Resolve() (*Config, error) {
 	}
 	if len(cfg.Device.Name) > 15 {
 		return nil, fmt.Errorf("device.name %q: interface names are at most 15 bytes", cfg.Device.Name)
+	}
+	switch f.Device.MTU {
+	case "", "quic":
+	case "tailnet":
+		cfg.Device.FitTailnet = true
+	default:
+		return nil, fmt.Errorf("device.mtu %q: quic or tailnet", f.Device.MTU)
 	}
 	if cfg.Device.Queues == 0 {
 		cfg.Device.Queues = 1

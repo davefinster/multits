@@ -98,6 +98,16 @@ LAN's. The end-to-end tests check both: 4 MiB of TCP each way with nothing
 fragmented, and a 1280-byte datagram sent with don't-fragment arriving
 whole.
 
+`device.mtu: tailnet` sizes the device and its routes to the tailnet instead,
+per family: 1300 for the IPv4 space, 1280 for the IPv6 spaces. Nothing the
+host sends then needs fragmenting, and a datagram that wouldn't fit is
+refused by the host's own kernel (`EMSGSIZE`), which quic-go's path-MTU
+discovery reads as the limit. Use it when the application sizes its own
+first packets, such as Traefik built with an `http3.initialPacketSize`
+option. Then quic-go settles on the largest packet the tailnet carries,
+rather than on 1280 bytes of payload that the gateway fragments every time,
+and that a netstack peer can't reassemble over IPv6 (see Limits below).
+
 On the tailnet side, each node is a `tsnet.Server` given an in-memory
 `tun.Device`. With one, tsnet hands the device every packet for the node's
 addresses, its TUN-mode Service VIPs and its advertised routes. It keeps

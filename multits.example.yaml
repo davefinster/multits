@@ -18,6 +18,11 @@ device:
   name: multits0
   # Queues each have a goroutine reading the application's packets.
   queues: 1
+  # quic (the default) leaves room for quic-go's 1280-byte first packets and
+  # fragments what the tailnet cannot carry. tailnet sizes the device to the
+  # tailnet exactly, so nothing is fragmented: for an application that sizes
+  # its own first packets, such as Traefik with http3.initialPacketSize.
+  mtu: quic
 
 api:
   # The local API: /status, /healthz, /whois, /decode, /encode, /withdraw.

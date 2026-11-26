@@ -16,6 +16,7 @@ type Options struct {
 	Name       string
 	TailnetMTU int
 	Queues     int
+	FitTailnet bool
 }
 
 // Interface is unavailable off Linux.

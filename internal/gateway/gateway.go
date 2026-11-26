@@ -85,6 +85,7 @@ func New(cfg *config.Config, host Host, log *slog.Logger) (*Gateway, error) {
 			Name:       cfg.Device.Name,
 			TailnetMTU: cfg.TailnetMTU,
 			Queues:     cfg.Device.Queues,
+			FitTailnet: cfg.Device.FitTailnet,
 		}, log)
 		if err != nil {
 			return nil, err

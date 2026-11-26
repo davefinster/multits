@@ -22,13 +22,21 @@
 // remote route carries the gateway's address in its family as its preferred
 // source, so a connection the application dials leaves from it.
 //
-// The device's MTU is the tailnet's plus 48, and so are its routes'. That is
-// room for an IPv6 packet carrying 1280 bytes of UDP, which is what quic-go,
-// and so Traefik's HTTP/3, sends its first packets with, and with the
-// don't-fragment bit: on an interface of the tailnet's own 1280 the kernel
-// refuses every one. Anything the tailnet cannot carry whole is fragmented
-// by the gateway (package xlat). TCP never is: the gateway clamps each SYN's
-// MSS to what the tailnet carries, so neither end sends a larger segment.
+// By default the device's MTU is the tailnet's plus 48, and so are its
+// routes'. That is room for an IPv6 packet carrying 1280 bytes of UDP, which
+// is what upstream quic-go, and so Traefik's HTTP/3, sends its first packets
+// with, and with the don't-fragment bit: on an interface of the tailnet's own
+// 1280 the kernel refuses every one. Anything the tailnet cannot carry whole
+// is fragmented by the gateway (package xlat). TCP never is: the gateway
+// clamps each SYN's MSS to what the tailnet carries, so neither end sends a
+// larger segment.
+//
+// Options.FitTailnet sizes them to the tailnet instead, per family: the
+// IPv4 space's routes 20 bytes over its MTU, which is an IPv4 packet of the
+// tailnet's MTU as IPv6, and the IPv6 spaces' at it. Nothing the host sends
+// then needs fragmenting, and quic-go's path MTU discovery settles on the
+// largest packet the tailnet carries. It is for an application that sizes its
+// own first packets to fit.
 package hostnet
 
 import (
@@ -55,6 +63,9 @@ const routeProtocol = netlink.RouteProtocol(77)
 // IPv6 and a UDP header on top of a 1280-byte QUIC packet.
 const headroom = 48
 
+// growth4 is how much larger an IPv4 packet is as IPv6.
+const growth4 = 20
+
 // addrGenModeNone is IN6_ADDR_GEN_MODE_NONE, which x/sys does not name.
 const addrGenModeNone = 1
 
@@ -67,6 +78,21 @@ type Options struct {
 	// Queues is how many queues the device has, each read by its own
 	// goroutine.
 	Queues int
+	// FitTailnet sizes the device and its routes to the tailnet, per
+	// family, instead of leaving room for quic-go's first packets.
+	FitTailnet bool
+}
+
+// mtus are the device's MTU and the MTUs of its IPv4 and IPv6 spaces'
+// routes. With room for quic-go, all three are the tailnet's plus headroom.
+// Fitted to the tailnet, the IPv4 space's is 20 bytes over it, which is what
+// an IPv4 packet of the tailnet's MTU becomes as IPv6, and the IPv6 spaces'
+// is the tailnet's own.
+func (o Options) mtus() (device, ipv4, ipv6 int) {
+	if o.FitTailnet {
+		return o.TailnetMTU + growth4, o.TailnetMTU + growth4, o.TailnetMTU
+	}
+	return o.TailnetMTU + headroom, o.TailnetMTU + headroom, o.TailnetMTU + headroom
 }
 
 // Interface is the device and what the gateway has configured on it.
@@ -93,7 +119,8 @@ func Open(scheme *addr.Scheme, tailnets []uint8, opts Options, log *slog.Logger)
 	if opts.Queues > 1 {
 		tunOpts = append(tunOpts, tun.WithQueues(opts.Queues))
 	}
-	dev, err := tun.CreateTUN(opts.Name, opts.TailnetMTU+headroom, tunOpts...)
+	deviceMTU, _, _ := opts.mtus()
+	dev, err := tun.CreateTUN(opts.Name, deviceMTU, tunOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("creating %s: %w", opts.Name, err)
 	}
@@ -156,7 +183,7 @@ func (i *Interface) setup(tailnets []uint8) error {
 	i.routes = append(i.routes, &netlink.Route{
 		LinkIndex: i.link.Attrs().Index,
 		Dst:       ipNet(i.scheme.Prefix()),
-		MTU:       i.opts.TailnetMTU + headroom,
+		MTU:       i.opts.TailnetMTU,
 		Protocol:  routeProtocol,
 		Priority:  1024,
 	})
@@ -169,7 +196,8 @@ func (i *Interface) setup(tailnets []uint8) error {
 		}
 	}
 
-	i.log.Info("Host device is up", "device", name, "mtu", i.opts.TailnetMTU+headroom, "prefix", i.scheme.Prefix())
+	deviceMTU, mtu4, mtu6 := i.opts.mtus()
+	i.log.Info("Host device is up", "device", name, "mtu", deviceMTU, "ipv4RouteMTU", mtu4, "ipv6RouteMTU", mtu6, "prefix", i.scheme.Prefix())
 	return nil
 }
 
@@ -189,13 +217,15 @@ func (i *Interface) localRoute(t uint8) *netlink.Route {
 // remoteRoute4 routes a tailnet's IPv4 peers into the device, from src if
 // it is known.
 func (i *Interface) remoteRoute4(t uint8, src netip.Addr) *netlink.Route {
-	return i.remoteRoute(i.scheme.SpacePrefix(t, addr.Remote, addr.SpaceIPv4), i.opts.TailnetMTU+headroom, src)
+	_, mtu, _ := i.opts.mtus()
+	return i.remoteRoute(i.scheme.SpacePrefix(t, addr.Remote, addr.SpaceIPv4), mtu, src)
 }
 
 // remoteRoute6 routes a tailnet's IPv6 peers, every other space of its
 // remote side, into the device.
 func (i *Interface) remoteRoute6(t uint8, src netip.Addr) *netlink.Route {
-	return i.remoteRoute(i.scheme.SidePrefix(t, addr.Remote), i.opts.TailnetMTU+headroom, src)
+	_, _, mtu := i.opts.mtus()
+	return i.remoteRoute(i.scheme.SidePrefix(t, addr.Remote), mtu, src)
 }
 
 func (i *Interface) remoteRoute(dst netip.Prefix, mtu int, src netip.Addr) *netlink.Route {

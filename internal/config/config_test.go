@@ -129,3 +129,18 @@ func TestDNS(t *testing.T) {
 		}
 	}
 }
+
+func TestDeviceMTU(t *testing.T) {
+	for y, want := range map[string]bool{"": false, "mtu: quic": false, "mtu: tailnet": true} {
+		cfg, err := Parse([]byte("device: {" + y + "}\ntailnets: {a: {id: 1, stateDir: /a}}"))
+		if err != nil {
+			t.Fatalf("%q: %v", y, err)
+		}
+		if cfg.Device.FitTailnet != want {
+			t.Errorf("%q: FitTailnet %v", y, cfg.Device.FitTailnet)
+		}
+	}
+	if _, err := Parse([]byte("device: {mtu: big}\ntailnets: {a: {id: 1, stateDir: /a}}")); err == nil {
+		t.Error("device.mtu big accepted")
+	}
+}
