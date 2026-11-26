@@ -198,9 +198,9 @@ root, which the gateway needs for `CAP_NET_ADMIN`, for making
 /etc/multits/multits.yaml`. `multits version` prints the commit it was built
 from.
 
-The GHCR package is private when first created, so a cluster pulls it with
-a `read:packages` token in an `imagePullSecret`, unless the package is made
-public. To build without the workflow:
+The GHCR package took the repository's visibility when first published:
+public, so a cluster pulls it with no `imagePullSecret`. To build without
+the workflow:
 
 ```sh
 docker buildx build --builder fleet --platform linux/amd64 --push -t ghcr.io/davefinster/multits:dev .
