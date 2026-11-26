@@ -1,0 +1,8 @@
+# What never reaches the image. multits.example.yaml stays: the config tests
+# in the build gate read it.
+dist/
+*.test
+.git/
+.github/
+.claude/
+README.md

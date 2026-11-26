@@ -1,0 +1,98 @@
+# Builds the image for linux/amd64 and pushes it to ghcr.io/davefinster/multits.
+#
+# One architecture, built natively on a GitHub-hosted amd64 runner: no QEMU.
+# The Dockerfile cross-compiles from the build machine's own architecture, so
+# adding linux/arm64 later is a platforms entry, not an emulated build.
+#
+# The Dockerfile's `go vet` and unit tests are the gate: a build that fails
+# them pushes nothing. The end-to-end tests need root in scratch network and
+# mount namespaces and run with `make test-netns`, not here.
+#
+# Tags: latest on main, the version on a v* tag, and sha-<short commit> on
+# every push, which is what to pin a deployment to. Pull requests build and
+# push nothing. They read the cache main filled and write none of their own,
+# so a pull request cannot put anything into a layer a later build on main
+# would reuse.
+#
+# Auth is the workflow's own GITHUB_TOKEN (packages: write), so there are no
+# secrets to configure. The first push creates the GHCR package, private and
+# linked to this repository through the image's source label; pulling it
+# from a cluster needs a read:packages token in an imagePullSecret, or the
+# package made public.
+#
+# Actions are pinned to a commit rather than a tag: a tag can be moved, and
+# this job holds a token that can publish under this account. Dependabot
+# (.github/dependabot.yml) bumps the commit and the version comment together.
+name: image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    # Files that never reach the image. Tag pushes ignore this filter and
+    # always build; pull requests always build.
+    paths-ignore:
+      - "**.md"
+      - .gitignore
+      - .github/dependabot.yml
+  pull_request:
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/davefinster/multits
+
+# Supersede an older run on a pull request. On main, let every run finish.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUSH: ${{ github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - if: env.PUSH == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=sha
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: ${{ env.PUSH == 'true' && 'type=gha,mode=max' || '' }}
+      - name: Summary
+        if: env.PUSH == 'true'
+        run: |
+          {
+            echo "### ${{ env.IMAGE }}"
+            echo
+            echo "Digest \`${{ steps.build.outputs.digest }}\`, tagged:"
+            jq -r '.tags[] | "- `" + . + "`"' <<< "$DOCKER_METADATA_OUTPUT_JSON"
+          } >> "$GITHUB_STEP_SUMMARY"

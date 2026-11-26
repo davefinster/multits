@@ -1,0 +1,83 @@
+# multits: one gateway onto several tailnets for an application that knows
+# nothing of them. Every setting but the tailnets has a default; `multits
+# check -config FILE` validates a file and prints its address plan.
+
+# The /32 every pseudo address is in. It must be unique local (fc00::/7), and
+# every replica of a gateway should use the same one, so that the addresses
+# an application is configured with mean the same thing on each. Changing it
+# changes every pseudo address.
+prefix: fdcc:79e6::/32
+
+# The largest packet the tailnets carry: Tailscale's default. The host's
+# device is 20 bytes larger, which is what an IPv4 packet of this size
+# becomes as IPv6.
+tailnetMTU: 1280
+
+device:
+  # The TUN device, in the application's network namespace.
+  name: multits0
+  # Queues each have a goroutine reading the application's packets.
+  queues: 1
+
+api:
+  # The local API: /status, /healthz, /whois, /decode, /encode, /withdraw.
+  # "off" turns it off. It answers whois for every tailnet, so keep it on
+  # the loopback.
+  listen: 127.0.0.1:9099
+
+shutdown:
+  # On SIGTERM the gateway withdraws its routes and Services, stays joined
+  # this long while peers move to another replica, then closes.
+  drainDelay: 10s
+
+dns:
+  # The application's resolver, in place of the one it had: point its
+  # resolv.conf here. Names in a tailnet's zones resolve to pseudo
+  # addresses on that tailnet; every other name goes upstream unchanged.
+  # The default is the prefix's ::53, which the gateway puts on its device.
+  listen: ["[fdcc:79e6::53]:53"]
+  # Where every other name goes. By default, the name servers in
+  # resolvConf other than the gateway's own; in a pod whose resolver is the
+  # gateway that leaves none, so name the cluster's here.
+  upstream: [10.152.183.10]
+  resolvConf: /etc/resolv.conf
+
+tailnets:
+  home:
+    # The tailnet's number in its pseudo addresses: fdcc:79e6:100::/40 for
+    # 1. It must never change, and never be reused for another tailnet.
+    id: 1
+    hostname: edge
+    stateDir: /var/lib/multits/home
+    authKeyFile: /run/secrets/home-authkey
+    advertiseTags: [tag:edge]
+    # Advertised routes. Their addresses arrive at the application as the
+    # gateway's own: 198.51.100.10 as fdcc:79e6:110::c633:640a.
+    routes:
+      - 198.51.100.10/32
+      - 2001:db8:feed:6ce8:d2b1:13c8:a553:acfc/128
+    # IPv6 outside Tailscale's fd7a:115c:a1e0::/48 needs a space of its own
+    # to have pseudo addresses, numbered 2 to 15. Like the id, a space's
+    # number is part of its addresses.
+    ipv6Spaces:
+      2: 2001:db8:feed:6ce8:d2b1:13c8:a553:acfc/128
+    # Tailscale Services hosted in TUN mode: every port and protocol of
+    # their virtual IPs arrives at the application.
+    services: [web]
+    # Use other nodes' subnet routes, so the application can dial what is
+    # behind them.
+    acceptRoutes: true
+    # Names resolved through this tailnet's resolver as well as its MagicDNS
+    # suffix, split-DNS domains and extra records, which are found by
+    # themselves.
+    dnsDomains: [corp.example]
+
+  work:
+    id: 2
+    stateDir: /var/lib/multits/work
+    # A federated identity instead of a key: the ID token is read at every
+    # join, so a rotated one is picked up.
+    clientID: k1234567890
+    idTokenFile: /var/run/secrets/tailscale/token
+    advertiseTags: [tag:edge]
+    ephemeral: true
