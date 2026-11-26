@@ -349,6 +349,62 @@ func TestE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("identify", func(t *testing.T) {
+		h := g.Handler()
+		identify := func(xff ...string) *httptest.ResponseRecorder {
+			req := httptest.NewRequest("GET", "/identify", nil)
+			for _, v := range xff {
+				req.Header.Add("X-Forwarded-For", v)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			return rec
+		}
+		for xff, want := range map[string][3]string{
+			"fdcc:79e6:100::6440:2": {"a", "client-a.", "100.64.0.2"},
+			"fdcc:79e6:200::6440:2": {"b", "client-b.", "100.64.0.2"},
+			// The last entry is the one the proxy asking appended.
+			"192.0.2.1, fdcc:79e6:200::6440:2": {"b", "client-b.", "100.64.0.2"},
+		} {
+			rec := identify(xff)
+			if rec.Code != 200 {
+				t.Fatalf("%s: %d %s", xff, rec.Code, rec.Body)
+			}
+			hd := rec.Header()
+			if hd.Get(HeaderTailnet) != want[0] || !strings.HasPrefix(hd.Get(HeaderNode), want[1]) || hd.Get(HeaderAddress) != want[2] {
+				t.Errorf("%s: %v", xff, hd)
+			}
+			if strings.HasSuffix(hd.Get(HeaderNode), ".") {
+				t.Errorf("%s: node %q keeps its trailing dot", xff, hd.Get(HeaderNode))
+			}
+			// testcontrol's nodes are a user's, not tagged.
+			if hd.Get(HeaderUserLogin) == "" || hd.Get(HeaderTags) != "" {
+				t.Errorf("%s: login %q tags %q", xff, hd.Get(HeaderUserLogin), hd.Get(HeaderTags))
+			}
+		}
+		for name, tc := range map[string]struct {
+			xff  []string
+			code int
+		}{
+			"no header":                   {nil, 400},
+			"not an address":              {[]string{"client-a"}, 400},
+			"an address on no tailnet":    {[]string{"10.1.2.3"}, 403},
+			"the gateway's own address":   {[]string{"fdcc:79e6:110::6440:1"}, 403},
+			"a pseudo address on nothing": {[]string{"fdcc:79e6:100::6440:99"}, 403},
+			"a tailnet not configured":    {[]string{"fdcc:79e6:900::6440:2"}, 403},
+		} {
+			rec := identify(tc.xff...)
+			if rec.Code != tc.code {
+				t.Errorf("%s: %d, want %d: %s", name, rec.Code, tc.code, rec.Body)
+			}
+			for _, hdr := range IdentityHeaders {
+				if rec.Header().Get(hdr) != "" {
+					t.Errorf("%s: refused, and still set %s", name, hdr)
+				}
+			}
+		}
+	})
+
 	t.Run("a tailnet that is not configured is unreachable at once", func(t *testing.T) {
 		start := time.Now()
 		_, err := net.DialTimeout("tcp", "[fdcc:79e6:900::6440:2]:80", 10*time.Second)
@@ -466,9 +522,21 @@ func eventually(t *testing.T, name string, f func() error) {
 
 // get fetches a URL from a tailnet client.
 func get(c *tsnet.Server, url string) (string, int, error) {
+	return getWith(c, url, nil)
+}
+
+// getWith is get, sending these headers.
+func getWith(c *tsnet.Server, url string, h http.Header) (string, int, error) {
 	hc := &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DialContext: c.Dial}}
 	defer hc.CloseIdleConnections()
-	resp, err := hc.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	for k, v := range h {
+		req.Header[k] = v
+	}
+	resp, err := hc.Do(req)
 	if err != nil {
 		return "", 0, err
 	}

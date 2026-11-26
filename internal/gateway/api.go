@@ -18,6 +18,8 @@ import (
 //	GET  /status            every tailnet: state, addresses, counters
 //	GET  /healthz           200 when every node is running, 503 otherwise
 //	GET  /whois?addr=A      who is behind a peer's pseudo address, [A]:port too
+//	GET  /identify          Traefik forwardAuth: who the client in X-Forwarded-For
+//	                        is, as Multits-* headers (identify.go)
 //	GET  /decode?addr=A     what a pseudo address says
 //	GET  /encode?tailnet=T&ip=I&side=local|remote
 //	POST /withdraw          stop publishing routes and Services, for a preStop hook
@@ -29,6 +31,7 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("GET /status", g.handleStatus)
 	mux.HandleFunc("GET /healthz", g.handleHealth)
 	mux.HandleFunc("GET /whois", g.handleWhoIs)
+	mux.HandleFunc("GET /identify", g.handleIdentify)
 	mux.HandleFunc("GET /decode", g.handleDecode)
 	mux.HandleFunc("GET /encode", g.handleEncode)
 	mux.HandleFunc("POST /withdraw", func(w http.ResponseWriter, r *http.Request) {

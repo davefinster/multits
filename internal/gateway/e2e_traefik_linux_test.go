@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -13,13 +14,17 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"tailscale.com/tsnet"
 )
 
 // An unmodified Traefik as the application: it has no idea there is a
 // tailnet. A client on tailnet a reaches it through the gateway, and it
 // proxies to a backend on tailnet b by that backend's pseudo address. Its
 // allow list tells the tailnets apart by prefix, and its access log and the
-// X-Forwarded-For it sends name the client by its pseudo address.
+// X-Forwarded-For it sends name the client by its pseudo address. A
+// forwardAuth middleware on the gateway's /identify tells the backend who
+// the client is, and nothing a client sends in those headers survives it.
 //
 // MULTITS_TRAEFIK names the binary: make test-netns ARGS='...' does not set
 // it, so run it as
@@ -41,6 +46,16 @@ func TestE2ETraefik(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend := &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/identified" {
+			// Every value of every identity header, so a forged one that
+			// survived alongside the real one would show.
+			var parts []string
+			for _, h := range IdentityHeaders {
+				parts = append(parts, h+"="+strings.Join(r.Header.Values(h), "|"))
+			}
+			fmt.Fprint(rw, strings.Join(parts, " "))
+			return
+		}
 		fmt.Fprintf(rw, "backend on b; remote %s; X-Forwarded-For %s", r.RemoteAddr, r.Header.Get("X-Forwarded-For"))
 	})}
 	go func() { _ = backend.Serve(ln) }()
@@ -51,6 +66,9 @@ func TestE2ETraefik(t *testing.T) {
 		t.Fatal(err)
 	}
 	peersA := w.g.Status().Tailnets[0].Peers
+	// The gateway's API, as the application beside it reaches it.
+	api := httptest.NewServer(w.g.Handler())
+	t.Cleanup(api.Close)
 
 	dir := t.TempDir()
 	dynamic := fmt.Sprintf(`
@@ -69,10 +87,20 @@ http:
       entryPoints: [web]
       rule: PathPrefix(%[1]s/by-name%[1]s)
       service: backend-by-name
+    identified:
+      entryPoints: [web]
+      rule: PathPrefix(%[1]s/identified%[1]s)
+      middlewares: [identify]
+      service: backend
   middlewares:
     tailnet-a:
       ipAllowList:
         sourceRange: ["%[2]s"]
+    identify:
+      forwardAuth:
+        address: "%[4]s/identify"
+        trustForwardHeader: false
+        authResponseHeadersRegex: "^Multits-"
   services:
     backend:
       loadBalancer:
@@ -82,7 +110,7 @@ http:
       loadBalancer:
         servers:
           - url: "http://client-b.b.ts.net:9000"
-`, "`", peersA, backendPseudo)
+`, "`", peersA, backendPseudo, api.URL)
 	if err := os.WriteFile(filepath.Join(dir, "dynamic.yaml"), []byte(dynamic), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +182,44 @@ http:
 				}
 			}
 			t.Logf("%s: %d %s", tc.name, code, body)
+			return nil
+		})
+	}
+
+	// Who the client is, by the gateway's account, whatever it claims.
+	forged := http.Header{}
+	for _, h := range IdentityHeaders {
+		forged.Set(h, "forged")
+	}
+	for _, tc := range []struct {
+		client  *tsnet.Server
+		gateway netip.Addr
+		want    []string
+	}{
+		{w.clientA, w.gwA[0], []string{HeaderTailnet + "=a ", HeaderAddress + "=100.64.0.2 ", HeaderNode + "=client-a.", HeaderTags + "= "}},
+		{w.clientB, w.gwB[0], []string{HeaderTailnet + "=b ", HeaderAddress + "=100.64.0.2 ", HeaderNode + "=client-b.", HeaderTags + "= "}},
+	} {
+		url := "http://" + netip.AddrPortFrom(tc.gateway, 8080).String() + "/identified"
+		eventually(t, "identified on "+tc.want[0], func() error {
+			body, code, err := getWith(tc.client, url, forged)
+			if err != nil {
+				return err
+			}
+			if code != 200 {
+				return fmt.Errorf("status %d: %s", code, body)
+			}
+			if strings.Contains(body, "forged") {
+				return fmt.Errorf("a forged header reached the backend: %s", body)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(body+" ", want) {
+					return fmt.Errorf("no %q in %s", want, body)
+				}
+			}
+			if strings.Contains(body, HeaderUserLogin+"= ") {
+				return fmt.Errorf("no login: %s", body)
+			}
+			t.Logf("identified: %s", body)
 			return nil
 		})
 	}

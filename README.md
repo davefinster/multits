@@ -306,6 +306,50 @@ http:
           - url: "http://[fdcc:79e6:200::6440:7]:8080"   # or 100.64.0.7 on tailnet 2
 ```
 
+A `/44` is everything that arrived over that tailnet, including addresses
+behind its subnet routers. To admit only the addresses Tailscale assigns to
+nodes, as an allow list of `100.64.0.0/10` and `fd7a:115c:a1e0::/48` does
+on a node, list `fdcc:79e6:100::6440:0/106` (the CGNAT range in tailnet 1's
+IPv4 space) and `fdcc:79e6:101::/48` (its Tailscale IPv6 space).
+
+#### Who the client is
+
+A backend behind Traefik sees Traefik, and the client only as a pseudo
+address in `X-Forwarded-For`, which its own tailnet can't look up. The
+gateway can: `GET /identify` is an authentication server for Traefik's
+`forwardAuth`. It reads the client's address from `X-Forwarded-For`, asks
+the client's tailnet who that is, and answers with headers that Traefik
+copies onto the request:
+
+```yaml
+http:
+  middlewares:
+    identify:
+      forwardAuth:
+        address: "http://127.0.0.1:9099/identify"
+        trustForwardHeader: false          # the client's address is the only entry
+        authResponseHeadersRegex: "^Multits-"
+```
+
+| Header | |
+| --- | --- |
+| `Multits-Tailnet` | the tailnet's name in the gateway's configuration |
+| `Multits-Address` | the client's address on it |
+| `Multits-Node` | the client node's MagicDNS name, whose domain is the tailnet's |
+| `Multits-Tags` | a tagged node's tags, comma-separated |
+| `Multits-User-Login`, `Multits-User-Name` | an untagged node's user, RFC 2047 encoded when not ASCII |
+
+A tagged node gets `Multits-Tags` and no user headers. A client that isn't a
+peer on a tailnet gets 403, and so does one its tailnet doesn't know, so put
+the middleware where only tailnet clients reach it. `forwardAuth` deletes
+every request header matching the regex before it adds the gateway's, so
+what a client sends in them never reaches the backend. It does that only
+on routers with the middleware. A backend should believe these headers only
+from a proxy that strips them everywhere else, such as one with a headers
+middleware on its entryPoints that sets each to `""`. Tags are a tailnet's
+own: `tag:ci` on one tailnet is not `tag:ci` on another, which is what
+`Multits-Node`'s domain tells apart.
+
 ## Local API
 
 On `127.0.0.1:9099` by default (`api.listen`):
@@ -315,10 +359,12 @@ On `127.0.0.1:9099` by default (`api.listen`):
 | `GET /status` | every tailnet: state, addresses with their pseudo addresses, routes, spaces, DNS zones, packet counts and drops by reason; the resolver's addresses and upstream |
 | `GET /healthz` | 200 when every node is `Running`, 503 otherwise |
 | `GET /whois?addr=A` | who is behind a peer's pseudo address (Tailscale's WhoIs, on the right tailnet); `[A]:port` works too |
+| `GET /identify` | the same for the last address in `X-Forwarded-For`, as `Multits-*` headers, for Traefik's `forwardAuth` ([above](#who-the-client-is)) |
 | `GET /decode?addr=A`, `GET /encode?tailnet=T&ip=I&side=local\|remote` | the scheme |
 | `POST /withdraw` | stop publishing routes and Services while staying joined |
 
-`/whois` answers for every tailnet, so keep the API on the loopback.
+`/whois` and `/identify` answer for every tailnet, so keep the API on the
+loopback.
 
 ## Tests
 
@@ -344,6 +390,9 @@ suffix, reverse lookups, NXDOMAIN, upstream passthrough, and dialling by
 name. Traefik, last run as the upstream v3.8.0 release, reaches a backend on
 the other tailnet by its MagicDNS name: the test mounts a resolv.conf naming
 the gateway over `/etc/resolv.conf`, in the test's own mount namespace.
+Through a `forwardAuth` middleware on `/identify` it tells that backend who
+each client is, while both clients share one address. Every `Multits-*`
+header a client sends is gone by then.
 
 The tests refuse to run in a network namespace that has any interface but
 `lo`, or to replace resolv.conf outside a mount namespace of their own.
