@@ -78,9 +78,12 @@ the rest:
 | `fdcc:79e6:T00::/44 dev multits0 src <node's IPv6 pseudo>` | every other space of the peer side |
 | `fdcc:79e6::/32 dev multits0` | everything else in the prefix, so a tailnet that isn't configured is answered with an ICMPv6 error (`network is unreachable`) instead of leaking out the default route |
 
-The node's own addresses and its Services' VIPs are also assigned to the
-device as /128s, for applications that bind one, and they become the routes'
-preferred sources.
+The node's own addresses, its Services' VIPs and the address of each host
+route it advertises (a /32 or /128) are also assigned to the device as
+/128s. That's for applications that bind one, and for replies sent from one
+with `IPV6_PKTINFO`, as quic-go sends every reply: the kernel refuses such a
+source (`EINVAL`) unless the address is assigned. The node's own addresses
+become the routes' preferred sources.
 
 **MTU.** The device and its routes have the tailnet's MTU plus 48: 1328 for
 Tailscale's 1280. That's room for an IPv6 packet carrying 1280 bytes of UDP,
@@ -342,8 +345,9 @@ The tests refuse to run in a network namespace that has any interface but
   `nas` is on. The gateway doesn't cache.
 - **UDP from a wildcard socket replies from the node's address.** That's the
   kernel's source selection, through the routes' preferred source. A UDP
-  service on a Service VIP or a routed address should bind that address, or
-  use `IPV6_PKTINFO`, which quic-go does.
+  service on a Service VIP or a host route's address should bind that
+  address, or use `IPV6_PKTINFO`, which quic-go does. An address in a wider
+  route isn't assigned, so only binding it with `IP_FREEBIND` works there.
 - **Exposure.** Everything listening on the wildcard address in the namespace
   is reachable from every tailnet, as far as its ACLs allow. That's the same
   as running tailscaled in the pod.

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/davefinster/multits/internal/config"
+	"golang.org/x/net/ipv6"
 	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
 )
@@ -75,6 +76,55 @@ func TestE2ERoutes(t *testing.T) {
 	// The echo must cross the gateway, not be answered by tsnet's own
 	// stack: its counters move by the request and the reply.
 	before := w.g.counts[1].snapshot(inbound).Packets
+	// A UDP server that answers from the address it was reached on, with
+	// IPV6_PKTINFO, as quic-go does: the kernel accepts that source only if
+	// the address is assigned, which for a host route the gateway does.
+	pktinfo, err := net.ListenPacket("udp6", "[::]:8054")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pktinfo.Close() })
+	pc := ipv6.NewPacketConn(pktinfo)
+	if err := pc.SetControlMessage(ipv6.FlagDst, true); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		b := make([]byte, 1500)
+		for {
+			n, cm, from, err := pc.ReadFrom(b)
+			if err != nil {
+				return
+			}
+			var reply *ipv6.ControlMessage
+			if cm != nil {
+				reply = &ipv6.ControlMessage{Src: cm.Dst}
+			}
+			if _, err := pc.WriteTo(b[:n], reply, from); err != nil {
+				t.Logf("replying from %v: %v", cm.Dst, err)
+			}
+		}
+	}()
+	eventually(t, "UDP from the routed address", func() error {
+		conn, err := w.clientA.Dial(w.ctx, "udp", "["+routed6.Addr().String()+"]:8054")
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := conn.Write([]byte("pktinfo")); err != nil {
+			return err
+		}
+		b := make([]byte, 64)
+		n, err := conn.Read(b)
+		if err != nil {
+			return err
+		}
+		if string(b[:n]) != "pktinfo" {
+			return fmt.Errorf("got %q", b[:n])
+		}
+		return nil
+	})
+
 	eventually(t, "ping", func() error {
 		res, err := lc.Ping(w.ctx, w.gwA[0], tailcfg.PingICMP)
 		if err != nil {

@@ -266,6 +266,17 @@ func (g *Gateway) addressesChanged(id uint8, a tailnet.Addresses) {
 	for _, ips := range a.Services {
 		others = append(others, ips...)
 	}
+	// A host route's address too. The AnyIP route already makes it the
+	// host's own for accepting, but a reply sent from it with IPV6_PKTINFO,
+	// as quic-go sends every one, is refused (EINVAL) unless the address is
+	// assigned to an interface: HTTP/3 to a routed address went unanswered
+	// while TCP worked. A wider route's addresses are not assigned, there
+	// being too many.
+	for _, p := range g.byID[id].Config().Routes {
+		if p.IsSingleIP() {
+			others = append(others, p.Addr())
+		}
+	}
 	if err := g.host.SetLocal(id, a.Self, others); err != nil {
 		g.log.Error("Cannot put the tailnet's addresses on the host device", "tailnet", id, "err", err)
 	}
