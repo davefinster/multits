@@ -208,6 +208,14 @@ tailnet, the options follow traefik-tsnet's `tailnets` options: `stateDir`,
 `id`, a space's number and the prefix are part of every pseudo address.**
 Treat them like a network plan: never renumber or reuse them.
 
+`run` waits for a configuration file that isn't there yet, and for any
+directory it's in. A gateway's file is often written by something starting
+beside it, such as a sidecar filling a volume, and a gateway that exited
+because it came first would only be restarted, with backoff, to find the
+file there. It logs when it starts waiting and every minute after, and stops
+on SIGTERM. `-config-wait 5m` bounds the wait. A file that's there but
+can't be read, or doesn't parse, fails at once.
+
 ### Image
 
 `ghcr.io/davefinster/multits` is built by

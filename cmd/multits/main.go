@@ -66,12 +66,13 @@ func main() {
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	path := fs.String("config", "/etc/multits/multits.yaml", "configuration file")
 	verbose := fs.Bool("v", false, "log tsnet's own debug output too")
+	configWait := fs.Duration("config-wait", 0, "run: how long to wait for the configuration file to appear; 0 waits as long as it takes")
 	_ = fs.Parse(args)
 
 	var err error
 	switch cmd {
 	case "run":
-		err = run(*path, *verbose)
+		err = run(*path, *verbose, *configWait)
 	case "check":
 		err = check(*path)
 	case "encode":
@@ -89,7 +90,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  multits run    -config FILE [-v]
+  multits run    -config FILE [-config-wait DURATION] [-v]
   multits check  -config FILE
   multits encode -config FILE TAILNET IP [local|remote]
   multits decode -config FILE ADDRESS
@@ -98,24 +99,30 @@ func usage() {
 	os.Exit(2)
 }
 
-func run(path string, verbose bool) error {
-	cfg, err := config.Load(path)
-	if err != nil {
-		return err
-	}
+func run(path string, verbose bool, configWait time.Duration) error {
 	level := slog.LevelInfo
 	if verbose {
 		level = slog.LevelDebug
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// A configuration that is not there yet is waited for (waitForFile);
+	// one that is there and wrong fails now.
+	if err := waitForFile(ctx, path, configWait, time.Second, log); err != nil {
+		return err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
 	log.Info("Starting", "version", version)
 
 	g, err := gateway.New(cfg, nil, log)
 	if err != nil {
 		return err
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	return g.Run(ctx)
 }
 
