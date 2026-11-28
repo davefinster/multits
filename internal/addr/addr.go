@@ -362,6 +362,17 @@ func (s *Scheme) Decode(a netip.Addr) (Addr, error) {
 	return Addr{Meta: meta, IP: netip.AddrFrom16(out)}, nil
 }
 
+// TailnetOf reports which configured tailnet the pseudo address in a, 16
+// bytes, is on, from its prefix and tailnet number alone. The rest of the
+// address may still be malformed, which DecodeTo says.
+func (s *Scheme) TailnetOf(a []byte) (uint8, bool) {
+	_ = a[15]
+	if [4]byte(a[:4]) != s.head || !s.tailnets[a[4]] {
+		return 0, false
+	}
+	return a[4], true
+}
+
 // DecodeTo decodes the pseudo address in a, 16 bytes, writing the address it
 // carries into out, which needs 16 bytes, and returning its length: 4 for
 // IPv4, 16 for IPv6. out and a may be the same.

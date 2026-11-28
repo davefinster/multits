@@ -35,6 +35,8 @@ func (c *counters) pass(d direction, n int) {
 
 func (c *counters) drop(d direction, r xlat.Reason) { c.drops[d][r].Add(1) }
 
+func (c *counters) dropN(d direction, r xlat.Reason, n int) { c.drops[d][r].Add(uint64(n)) }
+
 // Counts is a snapshot of counters.
 type Counts struct {
 	Packets uint64 `json:"packets"`

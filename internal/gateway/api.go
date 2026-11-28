@@ -78,6 +78,9 @@ type Status struct {
 	Tailnets []TailnetStatus `json:"tailnets"`
 	// Unrouted counts packets from the host that went to no tailnet.
 	Unrouted Counts `json:"unrouted"`
+	// Queues is how many of the host's packets each of the device's queues
+	// has read.
+	Queues []uint64 `json:"queues"`
 }
 
 // Status reports every tailnet.
@@ -85,6 +88,9 @@ func (g *Gateway) Status() Status {
 	st := Status{Prefix: g.scheme.Prefix(), Gateway: g.scheme.Gateway(), Unrouted: g.unrouted.snapshot(outbound)}
 	if g.dns != nil {
 		st.DNS = &DNSStatus{Listen: g.cfg.DNS.Listen, Upstream: g.dns.Upstream()}
+	}
+	for i := range g.queueReads {
+		st.Queues = append(st.Queues, g.queueReads[i].Load())
 	}
 	for _, tc := range g.cfg.Tailnets {
 		node := g.byID[tc.ID]

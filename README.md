@@ -115,6 +115,20 @@ only what one of its own sockets is waiting for (the PeerAPI). What the
 device produces goes out over WireGuard as though an operating system had
 sent it.
 
+What the host's device hands over in one read goes to its tailnet's node in
+one piece: one packet, or the segments of one the kernel left whole for the
+gateway to split. The node translates each packet as it reads it, straight
+into its own buffer. A node that isn't keeping up has 1024 packets waiting at
+most, and the rest are dropped and counted as `queue-full`, as a full device
+would drop them.
+
+**Queues.** `device.queues` gives the device more than one queue, each with
+its own reader. The gateway writes every flow from the tailnets to the queue
+its addresses and ports map to. The kernel sends the host's side of a flow to
+the queue the flow was last written to, so the flows spread over the readers,
+and peers writing to the host don't wait for each other. `/status` counts
+the packets each queue read.
+
 ## Translation
 
 - **IPv4 on a tailnet ↔ IPv6 on the host**: stateless IP/ICMP translation
@@ -364,7 +378,7 @@ On `127.0.0.1:9099` by default (`api.listen`):
 
 | | |
 | --- | --- |
-| `GET /status` | every tailnet: state, addresses with their pseudo addresses, routes, spaces, DNS zones, packet counts and drops by reason; the resolver's addresses and upstream |
+| `GET /status` | every tailnet: state, addresses with their pseudo addresses, routes, spaces, DNS zones, packet counts and drops by reason; the resolver's addresses and upstream; the packets each device queue read |
 | `GET /healthz` | 200 when every node is `Running`, 503 otherwise |
 | `GET /whois?addr=A` | who is behind a peer's pseudo address (Tailscale's WhoIs, on the right tailnet); `[A]:port` works too |
 | `GET /identify` | the same for the last address in `X-Forwarded-For`, as `Multits-*` headers, for Traefik's `forwardAuth` ([above](#who-the-client-is)) |
@@ -431,5 +445,11 @@ The tests refuse to run in a network namespace that has any interface but
   such a peer works over IPv4 and not IPv6 until that's fixed upstream.
   `TestFragmentsReassembleInGVisor` checks the fragments against gVisor
   itself.
-- The host-to-tailnet path allocates per packet, and one device queue is the
-  default. Neither has been profiled under load.
+- **More than one device queue is untested where it should matter.** One is
+  the default. With the client, the gateway and the application sharing one
+  six-core machine, four queues spread the flows and moved no more traffic
+  than one, every core being busy already. A gateway with cores to spare
+  and several busy peers is the case for `device.queues`, and hasn't been
+  measured.
+- A packet from the host that has to be fragmented is allocated again for
+  each fragment.

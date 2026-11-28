@@ -155,7 +155,7 @@ type Result struct {
 	Reason  Reason
 	// Tailnet is the tailnet a packet from the host is for.
 	Tailnet uint8
-	// Packet is the output, a slice of the buffer the caller passed.
+	// Packet is the output: the start of the buffer the caller passed.
 	Packet []byte
 	// Fragments, when set, replace Packet: a packet from the host too large
 	// for the tailnet, in fragments that fit, each its own allocation and
@@ -196,6 +196,18 @@ func (x *Translator) ToHost(tailnet uint8, pkt, out []byte) Result {
 	default:
 		return drop(Malformed)
 	}
+}
+
+// Tailnet reports which configured tailnet a packet from the host is
+// addressed to, from its destination's prefix and tailnet number alone. It is
+// for deciding where a packet is translated, before translating it: false is
+// a packet for no tailnet, and ToTailnet says what to do about it. True is
+// not yet a packet ToTailnet forwards.
+func (x *Translator) Tailnet(pkt []byte) (uint8, bool) {
+	if len(pkt) < ipv6HeaderLen || pkt[0]>>4 != 6 {
+		return 0, false
+	}
+	return x.scheme.TailnetOf(pkt[24:40])
 }
 
 // ToTailnet translates a packet the host sent towards a tailnet. out must be

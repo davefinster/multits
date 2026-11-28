@@ -16,7 +16,8 @@ tailnetMTU: 1280
 device:
   # The TUN device, in the application's network namespace.
   name: multits0
-  # Queues each have a goroutine reading the application's packets.
+  # Queues each have a goroutine reading the application's packets, and
+  # the tailnets' flows are spread over them. /status counts what each read.
   queues: 1
   # quic (the default) leaves room for quic-go's 1280-byte first packets and
   # fragments what the tailnet cannot carry. tailnet sizes the device to the

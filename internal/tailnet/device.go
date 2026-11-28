@@ -3,6 +3,7 @@ package tailnet
 import (
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/tailscale/wireguard-go/tun"
 )
@@ -21,6 +22,26 @@ const batchSize = 64
 // Deliver returns.
 type Deliver func(bufs [][]byte, offset int)
 
+// Batch is packets from the host for a node to send, as the host's device
+// read them: still the host's, untranslated. They stay in the buffer they
+// were read into, so a whole read reaches the node in one piece and each
+// packet is translated once, straight into the buffer the node reads with.
+type Batch struct {
+	// Slab holds the packets, and Packets says where in it each one is.
+	Slab    []byte
+	Packets []tun.ReadPacket
+	// Done, when set, is called once the node has finished with the batch,
+	// with the buffers its owner may then reuse.
+	Done func(*Batch)
+}
+
+// Translate turns one of the host's packets into what the tailnet carries.
+// out is at least as long as pkt, and at least MTU bytes. What it returns is
+// what the node sends: the first n bytes of out; or fragments, which replace
+// it and are sent in order; or nothing, with n zero, for a packet that was
+// dropped or answered instead.
+type Translate func(pkt, out []byte) (n int, fragments [][]byte)
+
 // device is the tun.Device the node is given in place of an operating
 // system's. With one, tsnet hands every packet it does not handle itself to
 // the device, and sends whatever the device produces as though the operating
@@ -33,86 +54,152 @@ type Deliver func(bufs [][]byte, offset int)
 // node's addresses, the virtual IPs of the Services it hosts in TUN mode,
 // and the routes it advertises comes here.
 type device struct {
-	deliver  Deliver
-	outbound chan []byte
-	events   chan tun.Event
+	deliver   Deliver
+	translate Translate
+	outbound  chan *Batch
+	// queued counts the packets in outbound, which is what bounds it.
+	queued atomic.Int64
+	events chan tun.Event
 
-	// pending is a packet the last Read had no room for, which the next one
-	// reads first. Only Read touches it, and the node reads from one
-	// goroutine.
-	pending []byte
+	// What the last Read left behind, which the next one reads first: the
+	// batch it was in the middle of and where, and the fragments of a
+	// packet it had no room for. Only Read touches these, and the node
+	// reads from one goroutine.
+	current   *Batch
+	next      int
+	fragments [][]byte
 
 	closeOnce sync.Once
 	closed    chan struct{}
 }
 
-func newDevice(deliver Deliver) *device {
+func newDevice(deliver Deliver, translate Translate) *device {
 	return &device{
-		deliver:  deliver,
-		outbound: make(chan []byte, queueDepth),
+		deliver:   deliver,
+		translate: translate,
+		// One slot per packet: a batch has at least one, so a batch that
+		// the packet count admits always has a slot.
+		outbound: make(chan *Batch, queueDepth),
 		events:   make(chan tun.Event, 1),
 		closed:   make(chan struct{}),
 	}
 }
 
-// send queues a packet for the node to read and send on the tailnet. It
-// takes ownership of pkt. It drops rather than blocks when the node is not
-// keeping up, so one slow tailnet never stalls the host's packets for the
-// others.
-func (d *device) send(pkt []byte) bool {
+// send queues a batch for the node to read and send on the tailnet. It
+// reports whether it took the batch: it refuses rather than blocks when the
+// node is not keeping up, so one slow tailnet never stalls the host's packets
+// for the others. A batch it refuses is still the caller's.
+func (d *device) send(b *Batch) bool {
+	n := int64(len(b.Packets))
+	if n == 0 {
+		return false
+	}
 	select {
-	case d.outbound <- pkt:
-		return true
 	case <-d.closed:
 		return false
 	default:
+	}
+	if d.queued.Add(n) > queueDepth {
+		d.queued.Add(-n)
+		return false
+	}
+	select {
+	case d.outbound <- b:
+		return true
+	default:
+		d.queued.Add(-n)
 		return false
 	}
 }
 
 // Read hands the node packets to send, as many as are waiting and fit, after
-// blocking for the first.
+// blocking for the first. It translates each one as it goes, into the slab
+// the node reads with.
 func (d *device) Read(slab []byte, packets []tun.ReadPacket) (int, error) {
 	if len(packets) == 0 || len(slab) < 2*tun.ReadPacketSpacing {
 		return 0, nil
 	}
 
-	pkt := d.pending
-	d.pending = nil
-	if pkt == nil {
-		select {
-		case <-d.closed:
-			return 0, os.ErrClosed
-		case pkt = <-d.outbound:
-		}
-	}
-
 	off, n := tun.ReadPacketSpacing, 0
-	for {
-		end := off + len(pkt)
-		if end+tun.ReadPacketSpacing > len(slab) {
-			if n == 0 {
-				// Larger than anything the node reads. Drop it rather than
-				// wedge the queue behind it.
-				return 0, nil
-			}
-			d.pending = pkt
-			return n, nil
-		}
-		copy(slab[off:end], pkt)
-		packets[n] = tun.ReadPacket{Offset: off, Size: len(pkt)}
+	// fits reports whether the read has room for another packet of size
+	// bytes, with the spacing the node wants after it.
+	fits := func(size int) bool {
+		return n < len(packets) && off+size+tun.ReadPacketSpacing <= len(slab)
+	}
+	placed := func(size int) {
+		packets[n] = tun.ReadPacket{Offset: off, Size: size}
 		n++
-		off = end + tun.ReadPacketSpacing
+		off += size + tun.ReadPacketSpacing
+	}
 
-		if n == len(packets) {
-			return n, nil
-		}
-		select {
-		case pkt = <-d.outbound:
+	for {
+		switch {
+		case len(d.fragments) > 0:
+			f := d.fragments[0]
+			if !fits(len(f)) {
+				if n > 0 {
+					return n, nil
+				}
+				// Larger than anything the node reads. Drop it rather
+				// than wedge the queue behind it.
+			} else {
+				copy(slab[off:], f)
+				placed(len(f))
+			}
+			if d.fragments = d.fragments[1:]; len(d.fragments) == 0 {
+				d.fragments = nil
+			}
+
+		case d.current != nil && d.next < len(d.current.Packets):
+			p := d.current.Packets[d.next]
+			pkt := d.current.Slab[p.Offset : p.Offset+p.Size]
+			// Room to translate into, which is more than the translation
+			// may come to.
+			room := max(len(pkt), MTU)
+			if !fits(room) {
+				if n > 0 {
+					return n, nil
+				}
+				d.next++
+				continue
+			}
+			d.next++
+			size, fragments := d.translate(pkt, slab[off:off+room])
+			if len(fragments) > 0 {
+				d.fragments = fragments
+			} else if size > 0 {
+				placed(size)
+			}
+
+		case d.current != nil:
+			if d.current.Done != nil {
+				d.current.Done(d.current)
+			}
+			d.current = nil
+
+		case n > 0:
+			select {
+			case b := <-d.outbound:
+				d.take(b)
+			default:
+				return n, nil
+			}
+
 		default:
-			return n, nil
+			select {
+			case <-d.closed:
+				return 0, os.ErrClosed
+			case b := <-d.outbound:
+				d.take(b)
+			}
 		}
 	}
+}
+
+// take starts reading a batch.
+func (d *device) take(b *Batch) {
+	d.queued.Add(-int64(len(b.Packets)))
+	d.current, d.next = b, 0
 }
 
 // Write takes packets the node has for the host.

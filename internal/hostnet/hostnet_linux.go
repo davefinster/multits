@@ -76,7 +76,7 @@ type Options struct {
 	// TailnetMTU is the largest packet the tailnets carry.
 	TailnetMTU int
 	// Queues is how many queues the device has, each read by its own
-	// goroutine.
+	// goroutine and written to for the flows that map to it.
 	Queues int
 	// FitTailnet sizes the device and its routes to the tailnet, per
 	// family, instead of leaving room for quic-go's first packets.

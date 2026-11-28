@@ -678,6 +678,37 @@ func TestRefusedFromTheHost(t *testing.T) {
 	}
 }
 
+// Tailnet reads the destination's tailnet and nothing more. Whether the
+// packet may go there is still ToTailnet's to say.
+func TestTailnet(t *testing.T) {
+	x := newTestTranslator(t)
+	udp := udpDatagram(1, 2, "x")
+	for _, tc := range []struct {
+		name, dst string
+		tailnet   uint8
+		ok        bool
+	}{
+		{"an IPv4 peer on tailnet 1", "fdcc:79e6:100::6440:2", 1, true},
+		{"an IPv6 peer on tailnet 2", "fdcc:79e6:201:ab12:4843:cd96:6240:5", 2, true},
+		{"the gateway's own side of tailnet 1", "fdcc:79e6:110::6440:2", 1, true},
+		{"a tailnet that is not configured", "fdcc:79e6:900::6440:2", 0, false},
+		{"the gateway itself", "fdcc:79e6::53", 0, false},
+		{"outside the prefix", "2001:db8::1", 0, false},
+		{"multicast", "ff02::2", 0, false},
+	} {
+		got, ok := x.Tailnet(packet6("fdcc:79e6:110::6440:1", tc.dst, protoUDP, udp))
+		if got != tc.tailnet || ok != tc.ok {
+			t.Errorf("%s: %d %v, want %d %v", tc.name, got, ok, tc.tailnet, tc.ok)
+		}
+	}
+	if _, ok := x.Tailnet(packet4("100.64.0.1", "100.64.0.2", protoUDP, 0, udp, true)); ok {
+		t.Error("IPv4 from the host has a tailnet")
+	}
+	if _, ok := x.Tailnet(packet6("fdcc:79e6:110::6440:1", "fdcc:79e6:100::6440:2", protoUDP, udp)[:39]); ok {
+		t.Error("a truncated header has a tailnet")
+	}
+}
+
 func TestNeighbourDiscoveryDoesNotCross(t *testing.T) {
 	x := newTestTranslator(t)
 	ns := []byte{135, 0, 0, 0, 0, 0, 0, 0}

@@ -118,10 +118,11 @@ func (a Addresses) All() []netip.Addr {
 
 // Node is one embedded Tailscale node.
 type Node struct {
-	cfg     Config
-	deliver Deliver
-	changed func(Addresses)
-	log     *slog.Logger
+	cfg       Config
+	deliver   Deliver
+	translate Translate
+	changed   func(Addresses)
+	log       *slog.Logger
 
 	// startMu serializes joins. It is not mu: tsnet.Server.Start takes no
 	// context, and Close must not queue behind it.
@@ -139,31 +140,36 @@ type Node struct {
 }
 
 // New prepares a node. deliver receives the packets it takes from the
-// tailnet; changed is told its addresses whenever they change.
-func New(cfg Config, deliver Deliver, changed func(Addresses), log *slog.Logger) *Node {
+// tailnet; translate turns each of the host's packets it is sent into the
+// tailnet's, as the node reads it; changed is told its addresses whenever
+// they change.
+func New(cfg Config, deliver Deliver, translate Translate, changed func(Addresses), log *slog.Logger) *Node {
 	return &Node{
-		cfg:     cfg,
-		deliver: deliver,
-		changed: changed,
-		log:     log.With("tailnet", cfg.Name),
-		state:   "Starting",
-		zones:   slices.Clone(cfg.DNSDomains),
+		cfg:       cfg,
+		deliver:   deliver,
+		translate: translate,
+		changed:   changed,
+		log:       log.With("tailnet", cfg.Name),
+		state:     "Starting",
+		zones:     slices.Clone(cfg.DNSDomains),
 	}
 }
 
 // Config returns the node's configuration.
 func (n *Node) Config() Config { return n.cfg }
 
-// Send queues a packet for the tailnet, taking ownership of it. It reports
-// false when the packet was dropped: the node is not up, or not keeping up.
-func (n *Node) Send(pkt []byte) bool {
+// Send queues a batch of the host's packets for the tailnet. It reports
+// whether it took the batch, which is then the node's until it calls the
+// batch's Done. It refuses when the node is not up, or not keeping up, and
+// the batch is still the caller's.
+func (n *Node) Send(b *Batch) bool {
 	n.mu.Lock()
 	dev := n.dev
 	n.mu.Unlock()
 	if dev == nil {
 		return false
 	}
-	return dev.send(pkt)
+	return dev.send(b)
 }
 
 // Addresses returns the node's addresses as last seen.
@@ -401,7 +407,7 @@ func (n *Node) build() (*tsnet.Server, *device, error) {
 		idToken = strings.TrimSpace(string(b))
 	}
 
-	dev := newDevice(n.deliver)
+	dev := newDevice(n.deliver, n.translate)
 	srv := &tsnet.Server{
 		Hostname:      n.cfg.Hostname,
 		Dir:           n.cfg.StateDir,
