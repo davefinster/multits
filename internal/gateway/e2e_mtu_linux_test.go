@@ -52,7 +52,7 @@ func TestE2EFitTailnet(t *testing.T) {
 
 	// The application sends to client a, with don't-fragment as quic-go
 	// does: 1300 bytes of IPv6 is the most, 1252 of UDP payload.
-	ln, err := w.clientA.ListenPacket("udp", netip.AddrPortFrom(ipv4(w.clientA), 9100).String())
+	ln, err := w.clientA.Server().ListenPacket("udp", netip.AddrPortFrom(w.clientA.IPv4(), 9100).String())
 	if err != nil {
 		t.Fatal(err)
 	}

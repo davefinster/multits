@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -29,18 +30,18 @@ func TestE2ERoutes(t *testing.T) {
 		a.IPv6Spaces = map[int]string{2: routed6.String()}
 	})
 
-	// The test control plane approves nothing by itself.
+	// Nothing in the tailnet's policy approves the routes, so its admin
+	// does: the gateway advertises them and no more.
 	node, _ := w.g.Node("a")
-	st, err := node.Status(w.ctx)
-	if err != nil {
+	gw := device(w.ctx, t, w.tailnetA, "gw")
+	if !slices.Equal(gw.AdvertisedRoutes, []netip.Prefix{routed4, routed6}) || len(gw.ApprovedRoutes) != 0 {
+		t.Fatalf("the gateway advertises %v, with %v approved", gw.AdvertisedRoutes, gw.ApprovedRoutes)
+	}
+	if err := w.tailnetA.ApproveRoutes(w.ctx, gw.ID, []netip.Prefix{routed4, routed6}); err != nil {
 		t.Fatal(err)
 	}
-	w.controlA.SetSubnetRoutes(st.Self.PublicKey, []netip.Prefix{routed4, routed6})
 
-	lc, err := w.clientA.LocalClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	lc := w.clientA.LocalClient()
 	if _, err := lc.EditPrefs(w.ctx, &ipn.MaskedPrefs{RouteAllSet: true, Prefs: ipn.Prefs{RouteAll: true}}); err != nil {
 		t.Fatal(err)
 	}
@@ -142,15 +143,10 @@ func TestE2ERoutes(t *testing.T) {
 
 	w.g.Withdraw(w.ctx)
 	eventually(t, "withdrawn", func() error {
-		for _, n := range w.controlA.AllNodes() {
-			if n.Hostinfo.Hostname() == "gw" {
-				if routes := n.Hostinfo.RoutableIPs().AsSlice(); len(routes) > 0 {
-					return fmt.Errorf("still advertised: %v", routes)
-				}
-				return nil
-			}
+		if routes := device(w.ctx, t, w.tailnetA, "gw").AdvertisedRoutes; len(routes) > 0 {
+			return fmt.Errorf("still advertised: %v", routes)
 		}
-		return fmt.Errorf("the gateway is not on the tailnet")
+		return nil
 	})
 	if state := node.State(); state != "Running" {
 		t.Errorf("withdrawing left the node %s", state)

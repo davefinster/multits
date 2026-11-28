@@ -14,8 +14,7 @@ addresses too.
 A tailnet's IPv4 addresses are unique only within that tailnet, and two
 tailnets routinely hand out the same ones. Its IPv6 addresses aren't
 reliably unique across tailnets either: Tailscale's original allocation
-derives them from the IPv4 address, and the in-process test control plane
-hands identical ones to two tailnets. So the gateway gives every address on
+derives them from the IPv4 address. So the gateway gives every address on
 every tailnet a **pseudo IPv6 address** that also encodes which tailnet the
 address is on. The mapping is deterministic and stateless: a packet's
 addresses alone say where it goes. The gateway keeps no table of flows, and
@@ -397,14 +396,23 @@ make traefik                                    # fetch Traefik v3.8.0, checksum
 make test-netns TRAEFIK=dist/traefik-v3.8.0-arm64/traefik   # plus Traefik as the application
 ```
 
-The end-to-end tests run two in-process control planes as two tailnets. In
-each, the gateway and a client get identical IPv4 and IPv6 addresses. The
-application is a plain kernel-socket server in the namespace (or Traefik).
+The end-to-end tests run one control plane inside the test, with two
+tailnets on it: [tstest](https://github.com/davefinster/tstest)'s, which
+decides what each node gets from its tailnet's policy file, as Tailscale's
+does. The gateway joins both with an auth key, as a tagged node. In each, it
+and a client get identical IPv4 and IPv6 addresses. The application is a
+plain kernel-socket server in the namespace (or Traefik).
+
 The tests check that each tailnet reaches the app from a distinct pseudo
 address, that the app's dials and replies reach the right tailnet, UDP, bulk
-TCP both ways, advertised IPv4 and IPv6 routes arriving through AnyIP, ICMP
-echo answered by the host kernel, whois, withdraw, and an unconfigured
-tailnet failing fast.
+TCP both ways, ICMP echo answered by the host kernel, whois, and an
+unconfigured tailnet failing fast. Advertised IPv4 and IPv6 routes arrive
+through AnyIP once the tailnet's admin approves them. A Tailscale Service
+that the policy lets the gateway host arrives the same way, and its name
+resolves to the gateway's own side. Withdrawing takes the routes and the
+Service back. `/identify` names a user's node by its user and a tagged one
+by its tags. With four device queues, flows from both tailnets spread over
+them and each gets back what it sent.
 
 For names, Go's resolver checks each tailnet's names, with and without
 `magicdns-aaaa`, plus the gateway's own names, an extra record outside the

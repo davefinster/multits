@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/davefinster/multits/internal/config"
-	"tailscale.com/tsnet"
+	"github.com/davefinster/tstest"
 )
 
 // device.queues gives the device that many queues, each with its own reader.
@@ -45,7 +45,7 @@ func TestE2EQueues(t *testing.T) {
 	defer app.Close()
 
 	// Reach the application once from each tailnet before the flows start.
-	for _, c := range []*tsnet.Server{w.clientA, w.clientB} {
+	for _, c := range []*tstest.Node{w.clientA, w.clientB} {
 		eventually(t, "the application", func() error {
 			_, _, err := get(c, "http://"+net.JoinHostPort(w.gwA[0].String(), "9200")+"/")
 			return err

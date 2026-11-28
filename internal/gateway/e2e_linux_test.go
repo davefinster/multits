@@ -20,16 +20,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/davefinster/multits/internal/addr"
 	"github.com/davefinster/multits/internal/config"
+	"github.com/davefinster/tstest"
+	"github.com/davefinster/tstest/control"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tailcfg/nodecap"
-	"tailscale.com/tsnet"
-	"tailscale.com/tstest/integration"
-	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/logger"
 )
 
@@ -61,57 +60,94 @@ func requireScratchNetns(t *testing.T) {
 	}
 }
 
-// startControl runs a control plane in the test: one tailnet.
-func startControl(t *testing.T, domain string, configure ...func(*testcontrol.Server)) *testcontrol.Server {
+// gatewayTag is the tag the gateway joins each tailnet with. A gateway is a
+// tagged device, as one that joins with an auth key or a federated identity
+// is, and its routes and Services are approved for the tag.
+const gatewayTag = "tag:gateway"
+
+// The tailnets' policies. Everything may reach everything, which leaves what
+// arrives to the gateway. Tailnet a also grants magicdns-aaaa, without which
+// MagicDNS gives a dual-stack peer's IPv4 address only, as b's does.
+const (
+	policyA = `{
+		"tagOwners": {"tag:gateway": [], "tag:ci": []},
+		"grants": [{"src": ["*"], "dst": ["*"], "ip": ["*"]}],
+		"nodeAttrs": [{"target": ["*"], "attr": ["magicdns-aaaa"]}],
+	}`
+	policyB = `{
+		"tagOwners": {"tag:gateway": []},
+		"grants": [{"src": ["*"], "dst": ["*"], "ip": ["*"]}],
+	}`
+)
+
+// newTailnet makes a tailnet on the control plane, with the addresses the
+// tests expect: handed out in order, so that the first device of every
+// tailnet has the same ones, and the IPv6 ones in a range that leaves them
+// looking like Tailscale's own.
+func newTailnet(t *testing.T, srv *control.Server, domain, policy string) *tstest.Fake {
 	t.Helper()
-	control := &testcontrol.Server{
-		DERPMap:        integration.RunDERPAndSTUN(t, logger.Discard, "127.0.0.1"),
-		DNSConfig:      &tailcfg.DNSConfig{Proxied: true},
-		MagicDNSDomain: domain,
-		Logf:           logger.Discard,
+	return tstest.NewFake(t, tstest.FakeOptions{Server: srv, Tailnet: control.TailnetOptions{
+		Name:           domain,
+		MagicDNSSuffix: domain,
+		Policy:         policy,
+		SequentialIPs:  true,
+		IPv6Pool:       netip.MustParsePrefix("fd7a:115c:a1e0:ab12:4843:cd96:6240:0/112"),
+	}})
+}
+
+// gatewayKey mints the auth key the gateway joins a tailnet with.
+func gatewayKey(ctx context.Context, t *testing.T, tn tstest.Tailnet) string {
+	t.Helper()
+	key, err := tn.CreateAuthKey(ctx, tstest.AuthKeyOptions{Tags: []string{gatewayTag}, Reusable: true, Ephemeral: true})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, c := range configure {
-		c(control)
-	}
-	control.HTTPTestServer = httptest.NewUnstartedServer(control)
-	control.HTTPTestServer.Start()
-	t.Cleanup(control.HTTPTestServer.Close)
-	return control
+	return key
 }
 
 // client is a node on a tailnet with tsnet's own stack, nothing to do with
-// the host.
-func client(ctx context.Context, t *testing.T, controlURL, name string) *tsnet.Server {
+// the host. It is a user's unless it is given tags.
+func client(ctx context.Context, t *testing.T, tn tstest.Tailnet, name, user string, tags ...string) *tstest.Node {
 	t.Helper()
-	s := &tsnet.Server{
-		Dir:        t.TempDir(),
-		ControlURL: controlURL,
-		Hostname:   name,
-		Ephemeral:  true,
-		Store:      new(mem.Store),
-		Logf:       logger.Discard,
+	opts := tstest.NodeOptions{
+		Hostname:  name,
+		User:      user,
+		Tags:      tags,
+		Ephemeral: true,
+		Store:     new(mem.Store),
+		Logf:      logger.Discard,
 	}
 	// MULTITS_E2E_TSLOG=1 shows the clients' own tsnet logs, filter drops
 	// and all.
 	if os.Getenv("MULTITS_E2E_TSLOG") != "" {
-		s.Logf = func(format string, args ...any) { t.Logf(name+": "+format, args...) }
+		opts.Logf = func(format string, args ...any) { t.Logf(name+": "+format, args...) }
 	}
-	t.Cleanup(func() { _ = s.Close() })
-	if _, err := s.Up(ctx); err != nil {
-		t.Fatalf("%s: %v", name, err)
-	}
+	n := tstest.NewNode(t, tn, opts)
 	// MULTITS_E2E_PCAP=DIR captures what each client's node sends and
 	// receives, as DIR/<name>.pcap.
 	if dir := os.Getenv("MULTITS_E2E_PCAP"); dir != "" {
-		if err := s.CapturePcap(ctx, filepath.Join(dir, name+".pcap")); err != nil {
+		if err := n.Server().CapturePcap(ctx, filepath.Join(dir, name+".pcap")); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return s
+	return n
 }
 
-func ipv4(s *tsnet.Server) netip.Addr   { v4, _ := s.TailscaleIPs(); return v4 }
-func ipv6Of(s *tsnet.Server) netip.Addr { _, v6 := s.TailscaleIPs(); return v6 }
+// device is a device as its tailnet's control plane has it, by hostname.
+func device(ctx context.Context, t *testing.T, tn tstest.Tailnet, hostname string) tstest.Device {
+	t.Helper()
+	devices, err := tn.Devices(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range devices {
+		if d.Hostname == hostname {
+			return d
+		}
+	}
+	t.Fatalf("no device %q on %s", hostname, tn.MagicDNSSuffix())
+	return tstest.Device{}
+}
 
 // The whole path on real nodes and a real kernel. Two tailnets, each with a
 // client at the same IPv4 and IPv6 address, reach one application that
@@ -181,7 +217,7 @@ func TestE2E(t *testing.T) {
 
 	t.Run("each tailnet reaches the application from its own address", func(t *testing.T) {
 		for _, tc := range []struct {
-			client *tsnet.Server
+			client *tstest.Node
 			gw     netip.Addr
 			from   string
 			to     string
@@ -208,7 +244,7 @@ func TestE2E(t *testing.T) {
 
 	t.Run("the application dials each tailnet's peer by its pseudo address", func(t *testing.T) {
 		for _, tc := range []struct {
-			client *tsnet.Server
+			client *tstest.Node
 			name   string
 			pseudo string
 			gw     netip.Addr
@@ -377,11 +413,29 @@ func TestE2E(t *testing.T) {
 			if strings.HasSuffix(hd.Get(HeaderNode), ".") {
 				t.Errorf("%s: node %q keeps its trailing dot", xff, hd.Get(HeaderNode))
 			}
-			// testcontrol's nodes are a user's, not tagged.
-			if hd.Get(HeaderUserLogin) == "" || hd.Get(HeaderTags) != "" {
-				t.Errorf("%s: login %q tags %q", xff, hd.Get(HeaderUserLogin), hd.Get(HeaderTags))
+			// The clients are their users', not tagged.
+			if login := map[string]string{"a": "alice@example.com", "b": "bob@example.com"}[want[0]]; hd.Get(HeaderUserLogin) != login || hd.Get(HeaderTags) != "" {
+				t.Errorf("%s: login %q tags %q, want %q and no tags", xff, hd.Get(HeaderUserLogin), hd.Get(HeaderTags), login)
 			}
 		}
+
+		// A tagged node is its tags, and nobody's.
+		ci := client(ctx, t, w.tailnetA, "ci", "", "tag:ci")
+		pseudo, err := g.Scheme().Encode(1, addr.Remote, ci.IPv4())
+		if err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, "the tagged node", func() error {
+			rec := identify(pseudo.String())
+			if rec.Code != 200 {
+				return fmt.Errorf("%d %s", rec.Code, rec.Body)
+			}
+			hd := rec.Header()
+			if hd.Get(HeaderTags) != "tag:ci" || hd.Get(HeaderUserLogin) != "" || hd.Get(HeaderUserName) != "" || !strings.HasPrefix(hd.Get(HeaderNode), "ci.") {
+				return fmt.Errorf("%v", hd)
+			}
+			return nil
+		})
 		for name, tc := range map[string]struct {
 			xff  []string
 			code int
@@ -424,13 +478,14 @@ func TestE2E(t *testing.T) {
 	t.Logf("unrouted: %+v", st.Unrouted)
 }
 
-// world is two tailnets with the gateway on both and a client on each, at
-// the same addresses.
+// world is two tailnets on one control plane, with the gateway on both and a
+// client on each, at the same addresses.
 type world struct {
 	ctx                context.Context
 	g                  *Gateway
-	controlA, controlB *testcontrol.Server
-	clientA, clientB   *tsnet.Server
+	control            *control.Server
+	tailnetA, tailnetB *tstest.Fake
+	clientA, clientB   *tstest.Node
 	gwA, gwB           []netip.Addr
 }
 
@@ -438,31 +493,47 @@ type world struct {
 // the test needs.
 func newWorld(t *testing.T, configure ...func(*config.File)) *world {
 	t.Helper()
+	w := newTailnets(t)
+	w.start(t, configure...)
+	return w
+}
+
+// newTailnets starts the control plane and the two tailnets, with nothing
+// on them yet: for a test that has something to set up in a tailnet before
+// the gateway joins it.
+func newTailnets(t *testing.T) *world {
+	t.Helper()
 	requireScratchNetns(t)
 	netns.SetEnabled(false)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	t.Cleanup(cancel)
 
+	// The control plane's own logs are for debugging it, like the nodes'.
+	opts := control.Options{Logf: logger.Discard}
+	if os.Getenv("MULTITS_E2E_TSLOG") != "" {
+		opts.Logf = t.Logf
+	}
+	srv := control.New(t, opts)
+	w := &world{ctx: ctx, control: srv}
+	w.tailnetA, w.tailnetB = newTailnet(t, srv, "a.ts.net", policyA), newTailnet(t, srv, "b.ts.net", policyB)
 	// Tailnet a has an extra record outside its MagicDNS suffix, which its
-	// resolver answers for and b's knows nothing of; and it grants
-	// magicdns-aaaa, without which MagicDNS gives a dual-stack peer's IPv4
-	// address only, as b's does.
-	controlA := startControl(t, "a.ts.net", func(c *testcontrol.Server) {
-		c.DNSConfig.ExtraRecords = []tailcfg.DNSRecord{{Name: "nas.corp.example", Type: "A", Value: "100.64.0.99"}}
-		c.DefaultNodeCapabilities = &tailcfg.NodeCapMap{
-			nodecap.HTTPS:            []tailcfg.RawMessage{},
-			nodecap.MagicDNSPeerAAAA: []tailcfg.RawMessage{},
-		}
-	})
-	controlB := startControl(t, "b.ts.net")
+	// resolver answers for and b's knows nothing of.
+	w.tailnetA.Tailnet().AddDNSRecords(tailcfg.DNSRecord{Name: "nas.corp.example", Type: "A", Value: "100.64.0.99"})
+	return w
+}
+
+// start runs the gateway on both tailnets and then joins a client to each.
+func (w *world) start(t *testing.T, configure ...func(*config.File)) {
+	t.Helper()
+	ctx, srv := w.ctx, w.control
 
 	f := &config.File{}
 	f.API.Listen = "off"
 	f.Shutdown.DrainDelay = "0s"
 	f.Tailnets = map[string]*config.Tailnet{
-		"a": {ID: 1, StateDir: t.TempDir(), ControlURL: controlA.HTTPTestServer.URL, Hostname: "gw", Ephemeral: true},
-		"b": {ID: 2, StateDir: t.TempDir(), ControlURL: controlB.HTTPTestServer.URL, Hostname: "gw", Ephemeral: true},
+		"a": {ID: 1, StateDir: t.TempDir(), ControlURL: srv.URL(), AuthKey: gatewayKey(ctx, t, w.tailnetA), Hostname: "gw", Ephemeral: true},
+		"b": {ID: 2, StateDir: t.TempDir(), ControlURL: srv.URL(), AuthKey: gatewayKey(ctx, t, w.tailnetB), Hostname: "gw", Ephemeral: true},
 	}
 	for _, c := range configure {
 		c(f)
@@ -488,16 +559,15 @@ func newWorld(t *testing.T, configure ...func(*config.File)) *world {
 
 	// The gateway joins first in both tailnets, so it and the clients get
 	// the same addresses in each.
-	w := &world{ctx: ctx, g: g, controlA: controlA, controlB: controlB}
+	w.g = g
 	w.gwA, w.gwB = waitRunning(ctx, t, g, "a"), waitRunning(ctx, t, g, "b")
 	t.Logf("gateway: a %v, b %v", w.gwA, w.gwB)
 
-	w.clientA, w.clientB = client(ctx, t, controlA.HTTPTestServer.URL, "client-a"), client(ctx, t, controlB.HTTPTestServer.URL, "client-b")
-	if ipv4(w.clientA) != ipv4(w.clientB) || ipv6Of(w.clientA) != ipv6Of(w.clientB) {
-		t.Fatalf("the clients' addresses differ (%v %v / %v %v); the test wants them to collide", ipv4(w.clientA), ipv6Of(w.clientA), ipv4(w.clientB), ipv6Of(w.clientB))
+	w.clientA, w.clientB = client(ctx, t, w.tailnetA, "client-a", "alice@example.com"), client(ctx, t, w.tailnetB, "client-b", "bob@example.com")
+	if w.clientA.IPv4() != w.clientB.IPv4() || w.clientA.IPv6() != w.clientB.IPv6() {
+		t.Fatalf("the clients' addresses differ (%v %v / %v %v); the test wants them to collide", w.clientA.IPv4(), w.clientA.IPv6(), w.clientB.IPv4(), w.clientB.IPv6())
 	}
-	t.Logf("both clients are %v and %v", ipv4(w.clientA), ipv6Of(w.clientA))
-	return w
+	t.Logf("both clients are %v and %v", w.clientA.IPv4(), w.clientA.IPv6())
 }
 
 // eventually retries f until it succeeds or 45 seconds pass.
@@ -521,12 +591,12 @@ func eventually(t *testing.T, name string, f func() error) {
 }
 
 // get fetches a URL from a tailnet client.
-func get(c *tsnet.Server, url string) (string, int, error) {
+func get(c *tstest.Node, url string) (string, int, error) {
 	return getWith(c, url, nil)
 }
 
 // getWith is get, sending these headers.
-func getWith(c *tsnet.Server, url string, h http.Header) (string, int, error) {
+func getWith(c *tstest.Node, url string, h http.Header) (string, int, error) {
 	hc := &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DialContext: c.Dial}}
 	defer hc.CloseIdleConnections()
 	req, err := http.NewRequest(http.MethodGet, url, nil)

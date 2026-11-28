@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"tailscale.com/tsnet"
+	"github.com/davefinster/tstest"
 )
 
 // An unmodified Traefik as the application: it has no idea there is a
@@ -192,7 +192,7 @@ http:
 		forged.Set(h, "forged")
 	}
 	for _, tc := range []struct {
-		client  *tsnet.Server
+		client  *tstest.Node
 		gateway netip.Addr
 		want    []string
 	}{
